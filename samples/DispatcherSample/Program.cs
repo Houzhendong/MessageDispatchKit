@@ -4,23 +4,57 @@ using MessageDispatching;
 var handler = new SampleHandler();
 
 await using var dispatcher = new KeyedOrderedDispatcher<string, MessageEnvelope>(
-    handler,
-    new KeyedOrderedDispatcherOptions
+    new DispatcherOptions
     {
-        Parallelism = 4,
-        BatchSize = 2
+        Parallelism = 1,
+        MaxParallelism = 4,
+        KeyBatchSize = 2,
+        ScaleInterval = TimeSpan.FromMilliseconds(10),
+        ScaleUpCooldown = TimeSpan.FromMilliseconds(10),
+        ScaleDownIdleDuration = TimeSpan.FromMilliseconds(100),
+        ScaleUpQueuedWorkItemsThreshold = 1,
+        ScaleUpMessagesPerWorkerThreshold = 2,
+        ScaleUpConsecutiveSamples = 1
     });
 
-for (var i = 1; i <= 8; i++)
+dispatcher.Start(handler);
+
+for (var i = 1; i <= 12; i++)
 {
-    dispatcher.Enqueue("hot-a", new MessageEnvelope(i, 35));
-    dispatcher.Enqueue("hot-b", new MessageEnvelope(i, 35));
-    dispatcher.Enqueue("cold-c", new MessageEnvelope(i, 10));
+    dispatcher.Enqueue("hot-a", new MessageEnvelope(i, 100));
+    dispatcher.Enqueue("hot-b", new MessageEnvelope(i, 100));
+    dispatcher.Enqueue("cold-c", new MessageEnvelope(i, 40));
 }
+
+var peakWorkers = dispatcher.GetStats().WorkerCount;
+var deadline = DateTimeOffset.UtcNow.AddSeconds(5);
+
+while (true)
+{
+    await Task.Delay(25);
+
+    var stats = dispatcher.GetStats();
+    peakWorkers = Math.Max(peakWorkers, stats.WorkerCount);
+
+    if (stats.PendingMessages == 0 && stats.WorkerCount == 1)
+    {
+        break;
+    }
+
+    if (DateTimeOffset.UtcNow > deadline)
+    {
+        throw new TimeoutException(
+            $"Timed out waiting for scale down. Pending={stats.PendingMessages}, Workers={stats.WorkerCount}");
+    }
+}
+
+Console.WriteLine($"max concurrency observed: {handler.MaxConcurrency}");
+Console.WriteLine($"peak workers observed: {peakWorkers}");
+Console.WriteLine($"workers after scale down: {dispatcher.GetStats().WorkerCount}");
 
 await dispatcher.CompleteAsync();
 
-Console.WriteLine($"max concurrency observed: {handler.MaxConcurrency}");
+await NoKeySample.RunAsync();
 
 public readonly record struct MessageEnvelope(int Sequence, int WorkMs);
 

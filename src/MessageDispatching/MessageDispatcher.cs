@@ -1,10 +1,8 @@
-using System.Collections.Frozen;
 using System.Threading.Channels;
 
 namespace MessageDispatching;
 
-public sealed class KeyedOrderedDispatcher<TKey, TMessage> : IAsyncDisposable
-    where TKey : notnull
+public sealed class MessageDispatcher<TInput, TOutput> : IAsyncDisposable
 {
     private enum WorkerWaitResult
     {
@@ -13,95 +11,96 @@ public sealed class KeyedOrderedDispatcher<TKey, TMessage> : IAsyncDisposable
         Retired
     }
 
-    private sealed class KeyState
+    private sealed class Subscription : IDisposable
     {
-        // CAS-based spinlock guarding the scheduling state transitions below. The caller is
-        // expected to preserve single-writer-per-key semantics for the per-key SPSC queue.
-        private int _gate;
+        private readonly MessageDispatcher<TInput, TOutput> _dispatcher;
+        private IMessageSubscriber<TOutput>? _subscriber;
 
-        public readonly Channel<TMessage> Queue = Channel.CreateUnbounded<TMessage>(
-            new UnboundedChannelOptions
-            {
-                SingleReader = true,
-                SingleWriter = true,
-                AllowSynchronousContinuations = false
-            });
-
-        // Count of queued messages not yet reserved by a worker. Mutated only inside Acquire():
-        // the SPSC channel's own Reader.Count is unsupported, so scheduling uses this counter.
-        public int UnreservedMessages;
-        public bool Active;
-
-        public Releaser Acquire()
+        public Subscription(
+            MessageDispatcher<TInput, TOutput> dispatcher,
+            IMessageSubscriber<TOutput> subscriber)
         {
-            var spinner = new SpinWait();
-            while (Interlocked.CompareExchange(ref _gate, 1, 0) != 0)
-            {
-                spinner.SpinOnce();
-            }
-
-            return new Releaser(this);
+            _dispatcher = dispatcher;
+            _subscriber = subscriber;
         }
 
-        public readonly struct Releaser : IDisposable
+        public void Dispose()
         {
-            private readonly KeyState _state;
-
-            internal Releaser(KeyState state) => _state = state;
-
-            public void Dispose() => Volatile.Write(ref _state._gate, 0);
+            var subscriber = Interlocked.Exchange(ref _subscriber, null);
+            if (subscriber is not null)
+            {
+                _dispatcher.Unsubscribe(subscriber);
+            }
         }
     }
 
-    // Published as copy-on-write frozen snapshots: hot-path reads are lock-free once a key exists,
-    // while the rare first enqueue for a new key takes the lock and publishes a rebuilt map.
-    private readonly object _statesLock = new();
-    private FrozenDictionary<TKey, KeyState> _states = FrozenDictionary<TKey, KeyState>.Empty;
-    private readonly Channel<TKey> _readyKeys;
+    private readonly Channel<TInput> _queue;
     private readonly DispatcherOptions _options;
     private readonly CancellationTokenSource _stopCts = new();
     private readonly CancellationTokenSource _scaleCts = new();
     private readonly object _lifetimeLock = new();
     private readonly object _workersLock = new();
+    private readonly object _subscribersLock = new();
     private readonly List<Task> _workers = new();
+    private readonly bool _singleWorkerMode;
+    private readonly bool _dynamicScalingEnabled;
     private Task? _scaleController;
 
     private int _pendingMessages;
+    private int _queuedWorkItemCount;
     private int _workerCount;
     private int _busyWorkers;
-    private int _queuedWorkItemCount;
     private int _scaleUpCandidateSamples;
     private long _lastScaleUpTick;
-    private IKeyedMessageHandler<TKey, TMessage>? _handler;
+    private IMessageTransformer<TInput, TOutput>? _transformer;
+    private IMessageSubscriber<TOutput>[] _subscribers = [];
     private bool _started;
     private bool _accepting;
     private bool _completed;
     private bool _disposed;
 
-    public KeyedOrderedDispatcher(DispatcherOptions? options = null)
+    public MessageDispatcher(DispatcherOptions? options = null)
     {
         _options = options ?? new DispatcherOptions();
         _options.Validate();
 
-        _readyKeys = Channel.CreateBounded<TKey>(
-            new BoundedChannelOptions(_options.EffectiveMaxParallelism)
+        _singleWorkerMode = _options.EffectiveMaxParallelism == 1;
+        _dynamicScalingEnabled = _options.IsDynamicScalingEnabled && !_singleWorkerMode;
+
+        _queue = Channel.CreateUnbounded<TInput>(
+            new UnboundedChannelOptions
             {
-                SingleReader = false,
+                SingleReader = _singleWorkerMode,
                 SingleWriter = false,
-                FullMode = BoundedChannelFullMode.Wait,
                 AllowSynchronousContinuations = false
             });
     }
 
-    public void Start(IKeyedMessageHandler<TKey, TMessage> handler)
+    public IDisposable Subscribe(IMessageSubscriber<TOutput> subscriber)
     {
-        ArgumentNullException.ThrowIfNull(handler);
+        ArgumentNullException.ThrowIfNull(subscriber);
+
+        lock (_subscribersLock)
+        {
+            var snapshot = Volatile.Read(ref _subscribers);
+            var updated = new IMessageSubscriber<TOutput>[snapshot.Length + 1];
+            Array.Copy(snapshot, updated, snapshot.Length);
+            updated[^1] = subscriber;
+            Volatile.Write(ref _subscribers, updated);
+        }
+
+        return new Subscription(this, subscriber);
+    }
+
+    public void Start(IMessageTransformer<TInput, TOutput> transformer)
+    {
+        ArgumentNullException.ThrowIfNull(transformer);
 
         lock (_lifetimeLock)
         {
             if (_disposed)
             {
-                throw new ObjectDisposedException(nameof(KeyedOrderedDispatcher<TKey, TMessage>));
+                throw new ObjectDisposedException(nameof(MessageDispatcher<TInput, TOutput>));
             }
 
             if (_completed)
@@ -114,7 +113,7 @@ public sealed class KeyedOrderedDispatcher<TKey, TMessage> : IAsyncDisposable
                 throw new InvalidOperationException("The dispatcher has already been started.");
             }
 
-            Volatile.Write(ref _handler, handler);
+            Volatile.Write(ref _transformer, transformer);
             _started = true;
             Volatile.Write(ref _accepting, true);
 
@@ -126,7 +125,7 @@ public sealed class KeyedOrderedDispatcher<TKey, TMessage> : IAsyncDisposable
                 }
             }
 
-            if (_options.IsDynamicScalingEnabled)
+            if (_dynamicScalingEnabled)
             {
                 _scaleController = ScaleControllerLoopAsync(_scaleCts.Token);
             }
@@ -137,14 +136,14 @@ public sealed class KeyedOrderedDispatcher<TKey, TMessage> : IAsyncDisposable
     {
         return new DispatcherStats(
             Volatile.Read(ref _pendingMessages),
-            Volatile.Read(ref _states).Count,
+            0,
             Volatile.Read(ref _workerCount),
             Volatile.Read(ref _busyWorkers),
             Volatile.Read(ref _queuedWorkItemCount),
             Volatile.Read(ref _accepting) && !Volatile.Read(ref _disposed));
     }
 
-    public void Enqueue(TKey key, TMessage message, CancellationToken cancellationToken = default)
+    public void Enqueue(TInput input, CancellationToken cancellationToken = default)
     {
         cancellationToken.ThrowIfCancellationRequested();
 
@@ -159,35 +158,16 @@ public sealed class KeyedOrderedDispatcher<TKey, TMessage> : IAsyncDisposable
 
             cancellationToken.ThrowIfCancellationRequested();
 
-            var state = GetOrCreateState(key);
-            var shouldSchedule = false;
+            Interlocked.Increment(ref _queuedWorkItemCount);
 
-            if (!state.Queue.Writer.TryWrite(message))
+            if (!_queue.Writer.TryWrite(input))
             {
-                throw new InvalidOperationException("Failed to enqueue the message into the key channel.");
+                Interlocked.Decrement(ref _queuedWorkItemCount);
+                throw new InvalidOperationException("Failed to enqueue the message.");
             }
-
-            using (state.Acquire())
-            {
-                state.UnreservedMessages++;
-
-                if (!state.Active)
-                {
-                    state.Active = true;
-                    shouldSchedule = true;
-                }
-            }
-
-            if (shouldSchedule)
-            {
-                ScheduleKey(key);
-            }
-
-            return;
         }
         catch
         {
-            // The message was counted, but enqueue/scheduling failed; roll the in-flight count back.
             MarkMessageCompleted();
             throw;
         }
@@ -195,7 +175,7 @@ public sealed class KeyedOrderedDispatcher<TKey, TMessage> : IAsyncDisposable
 
     public void Complete()
     {
-        var shouldCompleteWorkQueue = false;
+        var shouldCompleteQueue = false;
 
         lock (_lifetimeLock)
         {
@@ -206,13 +186,13 @@ public sealed class KeyedOrderedDispatcher<TKey, TMessage> : IAsyncDisposable
 
             _completed = true;
             Volatile.Write(ref _accepting, false);
-            shouldCompleteWorkQueue = Volatile.Read(ref _pendingMessages) == 0;
+            shouldCompleteQueue = Volatile.Read(ref _pendingMessages) == 0;
         }
 
-        if (shouldCompleteWorkQueue)
+        if (shouldCompleteQueue)
         {
             _scaleCts.Cancel();
-            _readyKeys.Writer.TryComplete();
+            _queue.Writer.TryComplete();
         }
     }
 
@@ -237,7 +217,7 @@ public sealed class KeyedOrderedDispatcher<TKey, TMessage> : IAsyncDisposable
             Volatile.Write(ref _accepting, false);
         }
 
-        _readyKeys.Writer.TryComplete();
+        _queue.Writer.TryComplete();
         _scaleCts.Cancel();
         _stopCts.Cancel();
 
@@ -286,19 +266,9 @@ public sealed class KeyedOrderedDispatcher<TKey, TMessage> : IAsyncDisposable
         {
             while (true)
             {
-                while (_readyKeys.Reader.TryRead(out var key))
+                while (_queue.Reader.TryRead(out var input))
                 {
-                    Interlocked.Decrement(ref _queuedWorkItemCount);
-                    Interlocked.Increment(ref _busyWorkers);
-
-                    try
-                    {
-                        ProcessKey(key, cancellationToken);
-                    }
-                    finally
-                    {
-                        Interlocked.Decrement(ref _busyWorkers);
-                    }
+                    ProcessQueuedInput(input, cancellationToken);
                 }
 
                 var waitResult = await WaitForWorkOrRetireAsync(cancellationToken).ConfigureAwait(false);
@@ -327,14 +297,35 @@ public sealed class KeyedOrderedDispatcher<TKey, TMessage> : IAsyncDisposable
         }
     }
 
+    private async Task SingleWorkerLoopAsync(CancellationToken cancellationToken)
+    {
+        try
+        {
+            while (await _queue.Reader.WaitToReadAsync(cancellationToken).ConfigureAwait(false))
+            {
+                while (_queue.Reader.TryRead(out var input))
+                {
+                    ProcessQueuedInput(input, cancellationToken);
+                }
+            }
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+        }
+        finally
+        {
+            Interlocked.Decrement(ref _workerCount);
+        }
+    }
+
     private async ValueTask<WorkerWaitResult> WaitForWorkOrRetireAsync(CancellationToken cancellationToken)
     {
         while (true)
         {
-            if (!_options.IsDynamicScalingEnabled ||
+            if (!_dynamicScalingEnabled ||
                 Volatile.Read(ref _workerCount) <= _options.Parallelism)
             {
-                return await _readyKeys.Reader.WaitToReadAsync(cancellationToken).ConfigureAwait(false)
+                return await _queue.Reader.WaitToReadAsync(cancellationToken).ConfigureAwait(false)
                     ? WorkerWaitResult.WorkAvailable
                     : WorkerWaitResult.Completed;
             }
@@ -344,7 +335,7 @@ public sealed class KeyedOrderedDispatcher<TKey, TMessage> : IAsyncDisposable
 
             try
             {
-                return await _readyKeys.Reader.WaitToReadAsync(idleCts.Token).ConfigureAwait(false)
+                return await _queue.Reader.WaitToReadAsync(idleCts.Token).ConfigureAwait(false)
                     ? WorkerWaitResult.WorkAvailable
                     : WorkerWaitResult.Completed;
             }
@@ -358,127 +349,51 @@ public sealed class KeyedOrderedDispatcher<TKey, TMessage> : IAsyncDisposable
         }
     }
 
-    private void ProcessKey(TKey key, CancellationToken cancellationToken)
-    {
-        if (!Volatile.Read(ref _states).TryGetValue(key, out var state))
-        {
-            return;
-        }
-
-        var processedMessages = 0;
-        var reservedMessages = 0;
-
-        using (state.Acquire())
-        {
-            reservedMessages = Math.Min(state.UnreservedMessages, _options.KeyBatchSize);
-            state.UnreservedMessages -= reservedMessages;
-        }
-
-        // Drain the reserved batch outside the lock. A single consumer is guaranteed by the
-        // Active flag, so the SPSC queue stays valid.
-        while (processedMessages < reservedMessages && state.Queue.Reader.TryRead(out var message))
-        {
-            try
-            {
-                var handler = Volatile.Read(ref _handler) ??
-                    throw new InvalidOperationException("The dispatcher has not been started.");
-                handler.Handle(key, message, cancellationToken);
-            }
-            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
-            {
-                throw;
-            }
-            catch (Exception ex)
-            {
-                TryReportError(key, message, ex, cancellationToken);
-            }
-            finally
-            {
-                MarkMessageCompleted();
-            }
-
-            processedMessages++;
-        }
-
-        var shouldReschedule = false;
-
-        using (state.Acquire())
-        {
-            if (state.UnreservedMessages > 0)
-            {
-                shouldReschedule = true;
-            }
-            else
-            {
-                state.Active = false;
-            }
-        }
-
-        if (shouldReschedule)
-        {
-            ScheduleKey(key);
-        }
-    }
-
-    private KeyState GetOrCreateState(TKey key)
-    {
-        var snapshot = Volatile.Read(ref _states);
-        if (snapshot.TryGetValue(key, out var state))
-        {
-            return state;
-        }
-
-        lock (_statesLock)
-        {
-            snapshot = _states;
-            if (snapshot.TryGetValue(key, out state))
-            {
-                return state;
-            }
-
-            state = new KeyState();
-
-            var updated = new Dictionary<TKey, KeyState>(snapshot.Count + 1)
-            {
-                [key] = state
-            };
-
-            foreach (var pair in snapshot)
-            {
-                updated.Add(pair.Key, pair.Value);
-            }
-
-            Volatile.Write(ref _states, updated.ToFrozenDictionary());
-            return state;
-        }
-    }
-
-    private void ScheduleKey(TKey key)
-    {
-        Interlocked.Increment(ref _queuedWorkItemCount);
-
-        if (_readyKeys.Writer.TryWrite(key))
-        {
-            return;
-        }
-
-        _ = ScheduleKeyAsync(key);
-    }
-
-    private async Task ScheduleKeyAsync(TKey key)
+    private void ProcessMessage(TInput input, CancellationToken cancellationToken)
     {
         try
         {
-            await _readyKeys.Writer.WriteAsync(key, _stopCts.Token).ConfigureAwait(false);
+            var transformer = Volatile.Read(ref _transformer) ??
+                throw new InvalidOperationException("The dispatcher has not been started.");
+            var output = transformer.Transform(input, cancellationToken);
+            Publish(output, cancellationToken);
         }
-        catch
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
-            Interlocked.Decrement(ref _queuedWorkItemCount);
+            throw;
+        }
+        catch (Exception ex)
+        {
+            TryReportTransformError(input, ex, cancellationToken);
+        }
+        finally
+        {
+            MarkMessageCompleted();
+        }
+    }
+
+    private void ProcessQueuedInput(TInput input, CancellationToken cancellationToken)
+    {
+        Interlocked.Decrement(ref _queuedWorkItemCount);
+        Interlocked.Increment(ref _busyWorkers);
+
+        try
+        {
+            ProcessMessage(input, cancellationToken);
+        }
+        finally
+        {
+            Interlocked.Decrement(ref _busyWorkers);
         }
     }
 
     private void SampleScaleUp()
     {
+        if (!_dynamicScalingEnabled)
+        {
+            return;
+        }
+
         var workerCount = Volatile.Read(ref _workerCount);
         var maxParallelism = _options.EffectiveMaxParallelism;
 
@@ -548,7 +463,9 @@ public sealed class KeyedOrderedDispatcher<TKey, TMessage> : IAsyncDisposable
         PruneCompletedWorkersCore();
 
         Interlocked.Increment(ref _workerCount);
-        var worker = WorkerLoopAsync(_stopCts.Token);
+        var worker = _singleWorkerMode
+            ? SingleWorkerLoopAsync(_stopCts.Token)
+            : WorkerLoopAsync(_stopCts.Token);
         _workers.Add(worker);
     }
 
@@ -606,21 +523,40 @@ public sealed class KeyedOrderedDispatcher<TKey, TMessage> : IAsyncDisposable
             !Volatile.Read(ref _disposed))
         {
             _scaleCts.Cancel();
-            _readyKeys.Writer.TryComplete();
+            _queue.Writer.TryComplete();
         }
     }
 
-    private void TryReportError(
-        TKey key,
-        TMessage message,
+    private void Publish(TOutput output, CancellationToken cancellationToken)
+    {
+        var subscribers = Volatile.Read(ref _subscribers);
+        foreach (var subscriber in subscribers)
+        {
+            try
+            {
+                subscriber.Handle(output, cancellationToken);
+            }
+            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+            {
+                throw;
+            }
+            catch (Exception ex)
+            {
+                TryReportSubscriberError(subscriber, output, ex, cancellationToken);
+            }
+        }
+    }
+
+    private void TryReportTransformError(
+        TInput input,
         Exception exception,
         CancellationToken cancellationToken)
     {
         try
         {
-            var handler = Volatile.Read(ref _handler) ??
+            var transformer = Volatile.Read(ref _transformer) ??
                 throw new InvalidOperationException("The dispatcher has not been started.");
-            handler.HandleError(key, message, exception, cancellationToken);
+            transformer.HandleError(input, exception, cancellationToken);
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
@@ -629,6 +565,58 @@ public sealed class KeyedOrderedDispatcher<TKey, TMessage> : IAsyncDisposable
         catch
         {
             // The dispatcher keeps processing; logging failures belong in the supplied error handler.
+        }
+    }
+
+    private static void TryReportSubscriberError(
+        IMessageSubscriber<TOutput> subscriber,
+        TOutput output,
+        Exception exception,
+        CancellationToken cancellationToken)
+    {
+        try
+        {
+            subscriber.HandleError(output, exception, cancellationToken);
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch
+        {
+            // Subscriber error handlers should own their own logging/retry failures.
+        }
+    }
+
+    private void Unsubscribe(IMessageSubscriber<TOutput> subscriber)
+    {
+        lock (_subscribersLock)
+        {
+            var snapshot = Volatile.Read(ref _subscribers);
+            var index = Array.IndexOf(snapshot, subscriber);
+            if (index < 0)
+            {
+                return;
+            }
+
+            if (snapshot.Length == 1)
+            {
+                Volatile.Write(ref _subscribers, []);
+                return;
+            }
+
+            var updated = new IMessageSubscriber<TOutput>[snapshot.Length - 1];
+            if (index > 0)
+            {
+                Array.Copy(snapshot, 0, updated, 0, index);
+            }
+
+            if (index < snapshot.Length - 1)
+            {
+                Array.Copy(snapshot, index + 1, updated, index, snapshot.Length - index - 1);
+            }
+
+            Volatile.Write(ref _subscribers, updated);
         }
     }
 }
