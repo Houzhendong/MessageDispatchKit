@@ -463,9 +463,13 @@ public sealed class MessageDispatcher<TInput, TOutput> : IAsyncDisposable
         PruneCompletedWorkersCore();
 
         Interlocked.Increment(ref _workerCount);
+        // Task.Run, not a direct call: an async method runs synchronously until its first real
+        // await, and the worker loop starts by draining the queue. Called directly from
+        // SampleScaleUp it would execute transformers on the timer thread while holding
+        // _workersLock, blocking scaling decisions and CompleteAsync/DisposeAsync.
         var worker = _singleWorkerMode
-            ? SingleWorkerLoopAsync(_stopCts.Token)
-            : WorkerLoopAsync(_stopCts.Token);
+            ? Task.Run(() => SingleWorkerLoopAsync(_stopCts.Token))
+            : Task.Run(() => WorkerLoopAsync(_stopCts.Token));
         _workers.Add(worker);
     }
 

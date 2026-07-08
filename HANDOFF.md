@@ -49,7 +49,7 @@ tests/
   - 实现按 key 保序、跨 key 并行。
   - 不绑定 protobuf，不绑定 `MessageType`。
   - 上游反序列化完成后调用同步方法 `Enqueue(key, message)`。
-  - 每个 key 内部用一个 SPSC（单生产者单消费者）unbounded channel 存队列；每个 key 的单写者语义由上游保证，dispatcher 的 CAS 自旋锁临界区只维护调度状态。
+  - 每个 key 内部用一个单读者、多写者 unbounded channel 存队列，同一 key 并发 `Enqueue` 是线程安全的。写入在 CAS 自旋锁临界区外（先写队列、后在锁内递增计数，计数只滞后不超前，详见 `Enqueue` 内注释）；单读者语义由 Active 标志保证。
 
 - `IKeyedMessageHandler.cs`
   - 业务 handler 和错误处理合并在同一个接口中，方法均为**同步** `void`。

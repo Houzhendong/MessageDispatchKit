@@ -15,20 +15,21 @@ public sealed class KeyedOrderedDispatcher<TKey, TMessage> : IAsyncDisposable
 
     private sealed class KeyState
     {
-        // CAS-based spinlock guarding the scheduling state transitions below. The caller is
-        // expected to preserve single-writer-per-key semantics for the per-key SPSC queue.
+        // CAS-based spinlock guarding the scheduling state transitions below. Queue writes stay
+        // outside the gate (the channel is multi-writer-safe); see the ordering comment in
+        // Enqueue. Single-reader is guaranteed by the Active flag.
         private int _gate;
 
         public readonly Channel<TMessage> Queue = Channel.CreateUnbounded<TMessage>(
             new UnboundedChannelOptions
             {
                 SingleReader = true,
-                SingleWriter = true,
+                SingleWriter = false,
                 AllowSynchronousContinuations = false
             });
 
         // Count of queued messages not yet reserved by a worker. Mutated only inside Acquire():
-        // the SPSC channel's own Reader.Count is unsupported, so scheduling uses this counter.
+        // the channel's own Reader.Count is unsupported, so scheduling uses this counter.
         public int UnreservedMessages;
         public bool Active;
 
@@ -83,12 +84,14 @@ public sealed class KeyedOrderedDispatcher<TKey, TMessage> : IAsyncDisposable
         _options = options ?? new DispatcherOptions();
         _options.Validate();
 
-        _readyKeys = Channel.CreateBounded<TKey>(
-            new BoundedChannelOptions(_options.EffectiveMaxParallelism)
+        // Unbounded so ScheduleKey never fails: at most one entry per active key can be queued,
+        // and messages themselves live in the per-key queues, so this adds no unbounded memory.
+        // Backpressure is out of scope by design (see HANDOFF: enqueue is non-blocking).
+        _readyKeys = Channel.CreateUnbounded<TKey>(
+            new UnboundedChannelOptions
             {
                 SingleReader = false,
                 SingleWriter = false,
-                FullMode = BoundedChannelFullMode.Wait,
                 AllowSynchronousContinuations = false
             });
     }
@@ -162,6 +165,11 @@ public sealed class KeyedOrderedDispatcher<TKey, TMessage> : IAsyncDisposable
             var state = GetOrCreateState(key);
             var shouldSchedule = false;
 
+            // Write-then-count ordering matters: the queue write stays outside the gate to keep
+            // the critical section short, so UnreservedMessages only ever lags the queue, never
+            // leads it. ProcessKey reserves at most UnreservedMessages entries, so a reserved
+            // TryRead cannot come up empty. FIFO per key holds because concurrent Enqueue calls
+            // for the same key are racing anyway — any interleaving of them is a valid order.
             if (!state.Queue.Writer.TryWrite(message))
             {
                 throw new InvalidOperationException("Failed to enqueue the message into the key channel.");
@@ -457,21 +465,10 @@ public sealed class KeyedOrderedDispatcher<TKey, TMessage> : IAsyncDisposable
     {
         Interlocked.Increment(ref _queuedWorkItemCount);
 
-        if (_readyKeys.Writer.TryWrite(key))
-        {
-            return;
-        }
-
-        _ = ScheduleKeyAsync(key);
-    }
-
-    private async Task ScheduleKeyAsync(TKey key)
-    {
-        try
-        {
-            await _readyKeys.Writer.WriteAsync(key, _stopCts.Token).ConfigureAwait(false);
-        }
-        catch
+        // The channel is unbounded, so TryWrite only fails after the writer is completed
+        // (pending drained to zero after Complete, or dispose). Either way workers are done
+        // with this key; just roll back the counter.
+        if (!_readyKeys.Writer.TryWrite(key))
         {
             Interlocked.Decrement(ref _queuedWorkItemCount);
         }
@@ -548,7 +545,11 @@ public sealed class KeyedOrderedDispatcher<TKey, TMessage> : IAsyncDisposable
         PruneCompletedWorkersCore();
 
         Interlocked.Increment(ref _workerCount);
-        var worker = WorkerLoopAsync(_stopCts.Token);
+        // Task.Run, not a direct call: an async method runs synchronously until its first real
+        // await, and the worker loop starts by draining the ready queue. Called directly from
+        // SampleScaleUp it would execute handlers on the timer thread while holding
+        // _workersLock, blocking scaling decisions and CompleteAsync/DisposeAsync.
+        var worker = Task.Run(() => WorkerLoopAsync(_stopCts.Token));
         _workers.Add(worker);
     }
 
