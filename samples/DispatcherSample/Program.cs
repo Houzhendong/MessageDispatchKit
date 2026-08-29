@@ -1,4 +1,5 @@
 using System.Collections.Concurrent;
+using System.Diagnostics;
 using MessageDispatching;
 
 var handler = new SampleHandler();
@@ -12,9 +13,13 @@ await using var dispatcher = new KeyedOrderedDispatcher<string, MessageEnvelope>
         ScaleInterval = TimeSpan.FromMilliseconds(10),
         ScaleUpCooldown = TimeSpan.FromMilliseconds(10),
         ScaleDownIdleDuration = TimeSpan.FromMilliseconds(100),
-        ScaleUpQueuedWorkItemsThreshold = 1,
-        ScaleUpMessagesPerWorkerThreshold = 2,
-        ScaleUpConsecutiveSamples = 1
+        ScaleUpQueuedWorkItemsThreshold = 0,
+        ScaleUpConsecutiveSamples = 1,
+        ScaleObserver = static change =>
+            Console.WriteLine(
+                $"keyed scale {(change.IsScaleUp ? "up" : "down")}: " +
+                $"{change.PreviousWorkerCount} -> {change.CurrentWorkerCount}, " +
+                $"pending={change.Stats.PendingMessages}, queued={change.Stats.QueuedWorkItems}")
     });
 
 dispatcher.Start(handler);
@@ -27,7 +32,7 @@ for (var i = 1; i <= 12; i++)
 }
 
 var peakWorkers = dispatcher.GetStats().WorkerCount;
-var deadline = DateTimeOffset.UtcNow.AddSeconds(5);
+var startTimestamp = Stopwatch.GetTimestamp();
 
 while (true)
 {
@@ -41,7 +46,7 @@ while (true)
         break;
     }
 
-    if (DateTimeOffset.UtcNow > deadline)
+    if (Stopwatch.GetElapsedTime(startTimestamp) > TimeSpan.FromSeconds(5))
     {
         throw new TimeoutException(
             $"Timed out waiting for scale down. Pending={stats.PendingMessages}, Workers={stats.WorkerCount}");

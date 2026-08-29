@@ -24,6 +24,7 @@ src/
     KeyedOrderedDispatcher.cs
     DispatcherOptions.cs
     DispatcherStats.cs
+    DispatcherScaleChange.cs
     IKeyedMessageHandler.cs
     IMessageTransformer.cs
     IMessageSubscriber.cs
@@ -56,11 +57,15 @@ tests/
   - 由调用方实现，并通过 `dispatcher.Start(handler)` 注入；handler 注入后才启动 worker。
 
 - `DispatcherOptions.cs`
-  - 配置并行度、keyed dispatcher 的单 key 批处理大小、动态扩缩容阈值。
+  - 配置并行度、keyed dispatcher 的单 key 批处理大小、动态扩缩容阈值，以及可选的 `ScaleObserver`。
   - 不再有积压上限：入队无背压、不限制最大入队数。
 
 - `DispatcherStats.cs`
   - 暴露当前积压消息数、已知分区数、worker 数、忙碌 worker 数、已排队 work item 数、是否继续接收消息。
+
+- `DispatcherScaleChange.cs`
+  - `KeyedOrderedDispatcher` 和 `MessageDispatcher` 共享的动态扩缩容通知数据。
+  - 包含扩缩容前后的 worker 数、方向判断及通知时的 stats 快照。
 
 - `samples/DispatcherSample/Program.cs`
   - 可运行示例。
@@ -248,15 +253,41 @@ MaxParallelism = 4
 - 当前 worker 数小于 `MaxParallelism`。
 - `ScaleInterval` 周期采样中连续 `ScaleUpConsecutiveSamples` 次命中扩容条件。
 - 当前 worker 全部处于忙碌状态。
-- 已排队 work item 数达到 `ScaleUpQueuedWorkItemsThreshold`。
-- 全局 pending 消息数达到 `workerCount * ScaleUpMessagesPerWorkerThreshold`。
+- 已排队 work item 数严格大于 `ScaleUpQueuedWorkItemsThreshold`。
 - 距离上次扩容至少经过 `ScaleUpCooldown`。
 
 扩容不会破坏同 key 顺序，因为 `KeyState.Active` 仍保证同一时刻一个 key 至多被一个 worker 处理。
 
 `Complete()` 后如果仍有已入队消息待排空，controller 仍允许扩容；当 pending 归零或 `DisposeAsync()` 取消时 controller 退出。
 
-缩容由空闲 worker 自愿退出完成，不会取消正在处理的 worker。worker 等待 work item 超过 `ScaleDownIdleDuration` 后，如果当前 worker 数大于 `Parallelism`，且 `PendingMessages == 0`、`QueuedWorkItems == 0`，则该 worker 退出。缩容下限是 `Parallelism`。
+缩容由空闲 worker 自愿退出完成，不会取消正在处理的 worker。worker 等待 work item 超过 `ScaleDownIdleDuration` 后，如果当前 worker 数大于 `Parallelism`，则尝试退出，缩容下限是 `Parallelism`。keyed dispatcher 在 `QueuedWorkItems == 0` 时即可退出；`PendingMessages` 可能只是串行堆积在 active hot key 后面，其他 worker 无法参与处理，因此不会阻止缩容。no-key dispatcher 仍要求 `PendingMessages == 0` 且 `QueuedWorkItems == 0`。
+
+### ScaleObserver（扩缩容观察回调）
+
+两个 dispatcher 都可以在构造时通过 `DispatcherOptions.ScaleObserver` 配置一个回调，用于接入调用方自己的日志或指标系统：
+
+```csharp
+await using var dispatcher = new KeyedOrderedDispatcher<long, UserEvent>(
+    new DispatcherOptions
+    {
+        Parallelism = 4,
+        MaxParallelism = 16,
+        ScaleObserver = change =>
+            logger.LogInformation(
+                "Dispatcher scaled {Direction} {Previous} -> {Current}, pending={Pending}, queued={Queued}",
+                change.IsScaleUp ? "up" : "down",
+                change.PreviousWorkerCount,
+                change.CurrentWorkerCount,
+                change.Stats.PendingMessages,
+                change.Stats.QueuedWorkItems)
+    });
+```
+
+每个 `DispatcherOptions` 只有一个 observer；dispatcher 构造时会保存该回调，运行期间不提供注册、注销或替换入口。`DispatcherScaleChange.IsScaleUp` 用于区分扩容和缩容。
+
+observer 只报告动态扩缩容实际提交的单步 worker 数变化。`Start()` 创建初始 worker，以及 `CompleteAsync()` / `DisposeAsync()` 导致的 worker 退出，都保持静默。`DispatcherScaleChange.Stats` 是通知时刻的 best-effort 快照，但 `Stats.WorkerCount` 始终等于 `CurrentWorkerCount`。
+
+observer 同步运行在内部 scale controller 或 retiring worker 任务上，不切换到调用方的 `SynchronizationContext`。回调应保持快速、线程安全，不要在回调内同步等待同一个 dispatcher 关闭。observer 被当作单个不透明回调调用；它抛出的任何异常都会被 dispatcher 吞掉，不影响扩缩容状态、worker/controller 任务、后续消息处理、`CompleteAsync()` 或 `DisposeAsync()`。
 
 ### ScaleInterval
 
@@ -285,18 +316,12 @@ ScaleDownIdleDuration = TimeSpan.FromSeconds(30)
 ### ScaleUpQueuedWorkItemsThreshold
 
 ```csharp
-ScaleUpQueuedWorkItemsThreshold = 2
+ScaleUpQueuedWorkItemsThreshold = 0
 ```
 
-触发扩容所需的已排队 work item 数。keyed dispatcher 中 work item 是 ready key；no-key dispatcher 中 work item 是全局输入队列里的待转换消息。
+默认值为 `0`，必须为零或正数，负数无效。实际扩容条件使用严格比较：`QueuedWorkItems > ScaleUpQueuedWorkItemsThreshold`。因此默认配置下，只要所有当前 worker 都忙碌并且至少有一个 work item 排队，就满足这一项条件。
 
-### ScaleUpMessagesPerWorkerThreshold
-
-```csharp
-ScaleUpMessagesPerWorkerThreshold = 8
-```
-
-触发扩容所需的每 worker pending 消息数。实际判断为 `PendingMessages >= WorkerCount * ScaleUpMessagesPerWorkerThreshold`。
+keyed dispatcher 中 `QueuedWorkItems` 表示 ready key 数；同一个 active key 后面串行积压的消息不会增加该值。no-key dispatcher 中 `QueuedWorkItems` 表示全局输入队列里尚未被 worker 取走的待转换消息数。
 
 ### ScaleUpConsecutiveSamples
 
@@ -477,22 +502,14 @@ dotnet test .\tests\MessageDispatching.Tests\MessageDispatching.Tests.csproj
 
 ## 当前验证结果
 
-已执行：
-
-```powershell
-dotnet build .\src\MessageDispatching\MessageDispatching.csproj
-dotnet build .\samples\DispatcherSample\DispatcherSample.csproj
-dotnet run --no-build --project .\samples\DispatcherSample\DispatcherSample.csproj
-dotnet test .\tests\MessageDispatching.Tests\MessageDispatching.Tests.csproj
-```
+已执行 Release 配置的库构建、完整测试、示例构建和运行，并用 `--no-build` 将全部 8 个 scale-related 用例重复运行 10 次；最后执行 `git diff --check` 和 `git status --short`。
 
 结果：
 
-- 编译通过。
-- 示例运行通过。
-- 每个 key 内部顺序保持递增。
-- 不同 key 实际发生并行处理。
-- 动态扩缩容验证通过：示例从 `Parallelism = 1` 开始，峰值观察到 `peak workers observed: 2`、`max concurrency observed: 2`，空闲后观察到 `workers after scale down: 1`。
-- no-key dispatcher 验证通过：24 条 raw packet 全部转换并发布，峰值观察到 `no-key peak workers observed: 2`、`no-key transform concurrency observed: 2`，空闲后观察到 `no-key workers after scale down: 1`。
+- 库和示例编译通过，均为 0 warning、0 error。
+- xUnit 完整测试通过：25/25；8 个 scale-related 用例重复 10 次，每轮 8/8 通过。
+- 示例运行通过，每个 key 内部顺序保持递增，不同 key 实际发生并行处理。
+- keyed observer 同步输出扩容和缩容通知；本次观察到 worker 从 1 扩到 3，再缩到 1，其中一次缩容通知的 `PendingMessages` 仍大于 0。
+- no-key observer 同步输出扩容和缩容通知；本次观察到 worker 从 1 扩到 4，再缩到 1，24 条 raw packet 全部转换并发布。
 - no-key MPSC 验证通过：`Parallelism = 1` 且未启用动态扩容时，观察到 `no-key mpsc published count: 4`、`no-key mpsc max concurrency observed: 1`。
-- xUnit 单元测试通过：12 个用例，覆盖 keyed dispatcher 的顺序、跨 key 并发、错误处理、排空和动态扩缩容，以及 no-key dispatcher 的转换发布、订阅者隔离、动态扩缩容和单 worker 模式。
+- `git diff --check` 通过；仅输出 Git 的 LF/CRLF 工作区转换提示。

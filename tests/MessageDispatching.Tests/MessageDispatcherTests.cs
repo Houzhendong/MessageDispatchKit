@@ -1,4 +1,4 @@
-using MessageDispatching;
+using System.Collections.Concurrent;
 using Xunit;
 
 namespace MessageDispatching.Tests;
@@ -44,8 +44,7 @@ public sealed class MessageDispatcherTests
                 ScaleInterval = TimeSpan.FromMilliseconds(1),
                 ScaleUpCooldown = TimeSpan.Zero,
                 ScaleDownIdleDuration = TimeSpan.FromMilliseconds(1),
-                ScaleUpQueuedWorkItemsThreshold = 1,
-                ScaleUpMessagesPerWorkerThreshold = 1,
+                ScaleUpQueuedWorkItemsThreshold = 0,
                 ScaleUpConsecutiveSamples = 1
             });
 
@@ -120,8 +119,7 @@ public sealed class MessageDispatcherTests
                 ScaleInterval = TimeSpan.FromMilliseconds(5),
                 ScaleUpCooldown = TimeSpan.FromMilliseconds(5),
                 ScaleDownIdleDuration = TimeSpan.FromMilliseconds(50),
-                ScaleUpQueuedWorkItemsThreshold = 2,
-                ScaleUpMessagesPerWorkerThreshold = 2,
+                ScaleUpQueuedWorkItemsThreshold = 1,
                 ScaleUpConsecutiveSamples = 1
             });
 
@@ -141,6 +139,114 @@ public sealed class MessageDispatcherTests
         Assert.Equal(40, subscriber.Messages.Count);
 
         await dispatcher.CompleteAsync();
+    }
+
+    [Fact]
+    public async Task ScaleUpRequiresQueuedWorkItemsToExceedThreshold()
+    {
+        using var transformer = new GatedTransformer();
+        await using var dispatcher = new MessageDispatcher<int, string>(
+            new DispatcherOptions
+            {
+                Parallelism = 1,
+                MaxParallelism = 2,
+                ScaleInterval = TimeSpan.FromMilliseconds(10),
+                ScaleUpCooldown = TimeSpan.FromDays(365),
+                ScaleDownIdleDuration = TimeSpan.FromSeconds(10),
+                ScaleUpQueuedWorkItemsThreshold = 1,
+                ScaleUpConsecutiveSamples = 1
+            });
+
+        dispatcher.Start(transformer);
+
+        try
+        {
+            dispatcher.Enqueue(0);
+            await TestWait.UntilAsync(() => transformer.FirstStarted);
+            await TestWait.UntilAsync(() =>
+            {
+                var stats = dispatcher.GetStats();
+                return stats.WorkerCount == 1 &&
+                    stats.BusyWorkers == 1 &&
+                    stats.QueuedWorkItems == 0;
+            });
+
+            dispatcher.Enqueue(1);
+            await TestWait.UntilAsync(() => dispatcher.GetStats().QueuedWorkItems == 1);
+
+            await Task.Delay(TimeSpan.FromMilliseconds(100));
+
+            var boundaryStats = dispatcher.GetStats();
+            Assert.Equal(1, boundaryStats.WorkerCount);
+            Assert.Equal(1, boundaryStats.BusyWorkers);
+            Assert.Equal(1, boundaryStats.QueuedWorkItems);
+
+            dispatcher.Enqueue(2);
+            await TestWait.UntilAsync(() => dispatcher.GetStats().WorkerCount == 2);
+        }
+        finally
+        {
+            transformer.Release();
+            await dispatcher.CompleteAsync();
+        }
+    }
+
+    [Fact]
+    public async Task ScaleObserverReportsTransitionsAndSuppressesCallbackFailures()
+    {
+        var transformer = new DelayingTransformer(TimeSpan.FromMilliseconds(25));
+        var subscriber = new RecordingSubscriber();
+        var scaleChanges = new ConcurrentQueue<DispatcherScaleChange>();
+        await using var dispatcher = new MessageDispatcher<int, string>(
+            new DispatcherOptions
+            {
+                Parallelism = 1,
+                MaxParallelism = 2,
+                ScaleInterval = TimeSpan.FromMilliseconds(5),
+                ScaleUpCooldown = TimeSpan.FromMilliseconds(5),
+                ScaleDownIdleDuration = TimeSpan.FromMilliseconds(50),
+                ScaleUpQueuedWorkItemsThreshold = 0,
+                ScaleUpConsecutiveSamples = 1,
+                ScaleObserver = change =>
+                {
+                    scaleChanges.Enqueue(change);
+                    throw new InvalidOperationException("Expected scale observer failure.");
+                }
+            });
+
+        using var subscription = dispatcher.Subscribe(subscriber);
+        dispatcher.Start(transformer);
+
+        Assert.Empty(scaleChanges);
+
+        for (var i = 0; i < 20; i++)
+        {
+            dispatcher.Enqueue(i);
+        }
+
+        await TestWait.UntilAsync(() => scaleChanges.Count >= 1);
+        await TestWait.UntilAsync(() => dispatcher.GetStats().PendingMessages == 0);
+        await TestWait.UntilAsync(() => scaleChanges.Count == 2);
+
+        var changes = scaleChanges.ToArray();
+        var scaleUp = changes[0];
+        Assert.Equal(1, scaleUp.PreviousWorkerCount);
+        Assert.Equal(2, scaleUp.CurrentWorkerCount);
+        Assert.True(scaleUp.IsScaleUp);
+        Assert.Equal(2, scaleUp.Stats.WorkerCount);
+
+        var scaleDown = changes[1];
+        Assert.Equal(2, scaleDown.PreviousWorkerCount);
+        Assert.Equal(1, scaleDown.CurrentWorkerCount);
+        Assert.False(scaleDown.IsScaleUp);
+        Assert.Equal(1, scaleDown.Stats.WorkerCount);
+        Assert.Equal(0, scaleDown.Stats.PendingMessages);
+        Assert.Equal(0, scaleDown.Stats.QueuedWorkItems);
+        Assert.Equal(20, subscriber.Messages.Count);
+
+        await dispatcher.CompleteAsync();
+
+        Assert.Equal(2, scaleChanges.Count);
     }
 
     [Fact]
@@ -183,6 +289,29 @@ public sealed class MessageDispatcherTests
 
         Assert.Equal(producerCount * messagesPerProducer + 6, subscriber.Messages.Count);
         Assert.Equal(1, transformer.MaxConcurrency);
+    }
+
+    private sealed class GatedTransformer : IMessageTransformer<int, string>, IDisposable
+    {
+        private readonly ManualResetEventSlim _firstStarted = new();
+        private readonly ManualResetEventSlim _release = new();
+
+        public bool FirstStarted => _firstStarted.IsSet;
+
+        public string Transform(int input, CancellationToken cancellationToken)
+        {
+            _firstStarted.Set();
+            _release.Wait(cancellationToken);
+            return $"parsed-{input}";
+        }
+
+        public void Release() => _release.Set();
+
+        public void Dispose()
+        {
+            _firstStarted.Dispose();
+            _release.Dispose();
+        }
     }
 
     private sealed class PrefixTransformer : IMessageTransformer<int, string>

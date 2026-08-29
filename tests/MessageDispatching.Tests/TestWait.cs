@@ -1,3 +1,5 @@
+using System.Diagnostics;
+
 namespace MessageDispatching.Tests;
 
 internal static class TestWait
@@ -7,12 +9,13 @@ internal static class TestWait
         TimeSpan? timeout = null,
         TimeSpan? pollInterval = null)
     {
-        var deadline = DateTimeOffset.UtcNow + (timeout ?? TimeSpan.FromSeconds(5));
+        var startTimestamp = Stopwatch.GetTimestamp();
+        var timeoutDuration = timeout ?? TimeSpan.FromSeconds(5);
         var delay = pollInterval ?? TimeSpan.FromMilliseconds(10);
 
         while (!condition())
         {
-            if (DateTimeOffset.UtcNow >= deadline)
+            if (Stopwatch.GetElapsedTime(startTimestamp) >= timeoutDuration)
             {
                 throw new TimeoutException("Timed out waiting for test condition.");
             }
