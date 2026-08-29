@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using MessageDispatching;
 
 public static class NoKeySample
@@ -15,9 +16,13 @@ public static class NoKeySample
                 ScaleInterval = TimeSpan.FromMilliseconds(10),
                 ScaleUpCooldown = TimeSpan.FromMilliseconds(10),
                 ScaleDownIdleDuration = TimeSpan.FromMilliseconds(100),
-                ScaleUpQueuedWorkItemsThreshold = 2,
-                ScaleUpMessagesPerWorkerThreshold = 2,
-                ScaleUpConsecutiveSamples = 1
+                ScaleUpQueuedWorkItemsThreshold = 0,
+                ScaleUpConsecutiveSamples = 1,
+                ScaleObserver = static change =>
+                    Console.WriteLine(
+                        $"no-key scale {(change.IsScaleUp ? "up" : "down")}: " +
+                        $"{change.PreviousWorkerCount} -> {change.CurrentWorkerCount}, " +
+                        $"pending={change.Stats.PendingMessages}, queued={change.Stats.QueuedWorkItems}")
             });
 
         using var subscription = dispatcher.Subscribe(subscriber);
@@ -29,7 +34,7 @@ public static class NoKeySample
         }
 
         var peakWorkers = dispatcher.GetStats().WorkerCount;
-        var deadline = DateTimeOffset.UtcNow.AddSeconds(5);
+        var startTimestamp = Stopwatch.GetTimestamp();
 
         while (true)
         {
@@ -43,7 +48,7 @@ public static class NoKeySample
                 break;
             }
 
-            if (DateTimeOffset.UtcNow > deadline)
+            if (Stopwatch.GetElapsedTime(startTimestamp) > TimeSpan.FromSeconds(5))
             {
                 throw new TimeoutException(
                     $"No-key dispatcher timed out waiting for scale down. Pending={stats.PendingMessages}, Workers={stats.WorkerCount}");

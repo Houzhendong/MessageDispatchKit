@@ -8,15 +8,15 @@ public sealed class DispatcherOptions
 
     public int KeyBatchSize { get; init; } = 32;
 
+    public Action<DispatcherScaleChange>? ScaleObserver { get; init; }
+
     public TimeSpan ScaleInterval { get; init; } = TimeSpan.FromMilliseconds(200);
 
     public TimeSpan ScaleUpCooldown { get; init; } = TimeSpan.FromSeconds(1);
 
     public TimeSpan ScaleDownIdleDuration { get; init; } = TimeSpan.FromSeconds(30);
 
-    public int ScaleUpQueuedWorkItemsThreshold { get; init; } = 2;
-
-    public int ScaleUpMessagesPerWorkerThreshold { get; init; } = 8;
+    public int ScaleUpQueuedWorkItemsThreshold { get; init; }
 
     public int ScaleUpConsecutiveSamples { get; init; } = 2;
 
@@ -71,18 +71,11 @@ public sealed class DispatcherOptions
                 "ScaleDownIdleDuration must be greater than zero.");
         }
 
-        if (ScaleUpQueuedWorkItemsThreshold <= 0)
+        if (ScaleUpQueuedWorkItemsThreshold < 0)
         {
             throw new ArgumentOutOfRangeException(
                 nameof(ScaleUpQueuedWorkItemsThreshold),
-                "ScaleUpQueuedWorkItemsThreshold must be greater than zero.");
-        }
-
-        if (ScaleUpMessagesPerWorkerThreshold <= 0)
-        {
-            throw new ArgumentOutOfRangeException(
-                nameof(ScaleUpMessagesPerWorkerThreshold),
-                "ScaleUpMessagesPerWorkerThreshold must be greater than zero.");
+                "ScaleUpQueuedWorkItemsThreshold must be zero or greater.");
         }
 
         if (ScaleUpConsecutiveSamples <= 0)

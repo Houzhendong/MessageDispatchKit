@@ -1,4 +1,4 @@
-using MessageDispatching;
+using System.Collections.Concurrent;
 using Xunit;
 
 namespace MessageDispatching.Tests;
@@ -112,8 +112,7 @@ public sealed class KeyedOrderedDispatcherTests
                 ScaleInterval = TimeSpan.FromMilliseconds(5),
                 ScaleUpCooldown = TimeSpan.FromMilliseconds(5),
                 ScaleDownIdleDuration = TimeSpan.FromMilliseconds(50),
-                ScaleUpQueuedWorkItemsThreshold = 1,
-                ScaleUpMessagesPerWorkerThreshold = 2,
+                ScaleUpQueuedWorkItemsThreshold = 0,
                 ScaleUpConsecutiveSamples = 1
             });
 
@@ -136,11 +135,161 @@ public sealed class KeyedOrderedDispatcherTests
     }
 
     [Fact]
+    public async Task ScaleUpRequiresQueuedWorkItemsToExceedThreshold()
+    {
+        using var handler = new BlockingKeyedHandler();
+        await using var dispatcher = new KeyedOrderedDispatcher<string, int>(
+            new DispatcherOptions
+            {
+                Parallelism = 1,
+                MaxParallelism = 2,
+                KeyBatchSize = 1,
+                ScaleInterval = TimeSpan.FromMilliseconds(10),
+                ScaleUpCooldown = TimeSpan.FromDays(365),
+                ScaleDownIdleDuration = TimeSpan.FromSeconds(10),
+                ScaleUpQueuedWorkItemsThreshold = 1,
+                ScaleUpConsecutiveSamples = 1
+            });
+
+        dispatcher.Start(handler);
+
+        try
+        {
+            dispatcher.Enqueue("active", 0);
+            await TestWait.UntilAsync(() => handler.FirstStarted);
+            await TestWait.UntilAsync(() =>
+            {
+                var stats = dispatcher.GetStats();
+                return stats.WorkerCount == 1 &&
+                    stats.BusyWorkers == 1 &&
+                    stats.QueuedWorkItems == 0;
+            });
+
+            dispatcher.Enqueue("queued-1", 1);
+            await TestWait.UntilAsync(() => dispatcher.GetStats().QueuedWorkItems == 1);
+
+            await Task.Delay(TimeSpan.FromMilliseconds(100));
+
+            var boundaryStats = dispatcher.GetStats();
+            Assert.Equal(1, boundaryStats.WorkerCount);
+            Assert.Equal(1, boundaryStats.BusyWorkers);
+            Assert.Equal(1, boundaryStats.QueuedWorkItems);
+
+            dispatcher.Enqueue("queued-2", 2);
+            await TestWait.UntilAsync(() => dispatcher.GetStats().WorkerCount == 2);
+        }
+        finally
+        {
+            handler.Release();
+            await dispatcher.CompleteAsync();
+        }
+    }
+
+    [Fact]
+    public async Task IdleDynamicWorkerRetiresWhileHotKeyStillHasPendingMessages()
+    {
+        using var handler = new GatedKeyedHandler();
+        var scaleChanges = new ConcurrentQueue<DispatcherScaleChange>();
+        await using var dispatcher = new KeyedOrderedDispatcher<string, int>(
+            new DispatcherOptions
+            {
+                Parallelism = 1,
+                MaxParallelism = 2,
+                KeyBatchSize = 1,
+                ScaleInterval = TimeSpan.FromMilliseconds(5),
+                ScaleUpCooldown = TimeSpan.FromMilliseconds(5),
+                ScaleDownIdleDuration = TimeSpan.FromMilliseconds(50),
+                ScaleUpConsecutiveSamples = 1,
+                ScaleObserver = scaleChanges.Enqueue
+            });
+
+        dispatcher.Start(handler);
+
+        Assert.Empty(scaleChanges);
+
+        try
+        {
+            dispatcher.Enqueue("hot", 0);
+            await TestWait.UntilAsync(() => handler.HotStarted);
+
+            for (var i = 1; i <= 3; i++)
+            {
+                dispatcher.Enqueue("hot", i);
+            }
+
+            dispatcher.Enqueue("cold", 0);
+            await TestWait.UntilAsync(() => handler.ColdStarted);
+            await TestWait.UntilAsync(() =>
+            {
+                var stats = dispatcher.GetStats();
+                return stats.WorkerCount == 2 && stats.BusyWorkers == 2;
+            });
+            await TestWait.UntilAsync(() => scaleChanges.Count == 1);
+
+            var scaleUp = Assert.Single(scaleChanges);
+            Assert.Equal(1, scaleUp.PreviousWorkerCount);
+            Assert.Equal(2, scaleUp.CurrentWorkerCount);
+            Assert.True(scaleUp.IsScaleUp);
+            Assert.Equal(2, scaleUp.Stats.WorkerCount);
+
+            handler.ReleaseCold();
+
+            await TestWait.UntilAsync(() =>
+            {
+                var stats = dispatcher.GetStats();
+                return stats.WorkerCount == 1 &&
+                    stats.BusyWorkers == 1 &&
+                    stats.QueuedWorkItems == 0 &&
+                    stats.PendingMessages > 0;
+            });
+            await TestWait.UntilAsync(() => scaleChanges.Count == 2);
+
+            var scaleDown = scaleChanges.ToArray()[1];
+            Assert.Equal(2, scaleDown.PreviousWorkerCount);
+            Assert.Equal(1, scaleDown.CurrentWorkerCount);
+            Assert.False(scaleDown.IsScaleUp);
+            Assert.Equal(1, scaleDown.Stats.WorkerCount);
+            Assert.Equal(0, scaleDown.Stats.QueuedWorkItems);
+            Assert.True(scaleDown.Stats.PendingMessages > 0);
+        }
+        finally
+        {
+            handler.ReleaseAll();
+            await dispatcher.CompleteAsync();
+        }
+
+        Assert.Equal(2, scaleChanges.Count);
+        Assert.Equal(0, dispatcher.GetStats().PendingMessages);
+    }
+
+    [Fact]
     public async Task EnqueueBeforeStartThrows()
     {
         await using var dispatcher = new KeyedOrderedDispatcher<string, int>();
 
         Assert.Throws<InvalidOperationException>(() => dispatcher.Enqueue("a", 1));
+    }
+
+    private sealed class BlockingKeyedHandler : IKeyedMessageHandler<string, int>, IDisposable
+    {
+        private readonly ManualResetEventSlim _firstStarted = new();
+        private readonly ManualResetEventSlim _release = new();
+
+        public bool FirstStarted => _firstStarted.IsSet;
+
+        public void Handle(string key, int message, CancellationToken cancellationToken)
+        {
+            _firstStarted.Set();
+            _release.Wait(cancellationToken);
+        }
+
+        public void Release() => _release.Set();
+
+        public void Dispose()
+        {
+            _firstStarted.Dispose();
+            _release.Dispose();
+        }
     }
 
     private sealed class RecordingKeyedHandler : IKeyedMessageHandler<string, int>
@@ -181,6 +330,48 @@ public sealed class KeyedOrderedDispatcherTests
                     ? messages.ToArray()
                     : Array.Empty<int>();
             }
+        }
+    }
+
+    private sealed class GatedKeyedHandler : IKeyedMessageHandler<string, int>, IDisposable
+    {
+        private readonly ManualResetEventSlim _hotStarted = new();
+        private readonly ManualResetEventSlim _coldStarted = new();
+        private readonly ManualResetEventSlim _releaseHot = new();
+        private readonly ManualResetEventSlim _releaseCold = new();
+
+        public bool HotStarted => _hotStarted.IsSet;
+
+        public bool ColdStarted => _coldStarted.IsSet;
+
+        public void Handle(string key, int message, CancellationToken cancellationToken)
+        {
+            if (key == "hot" && message == 0)
+            {
+                _hotStarted.Set();
+                _releaseHot.Wait(cancellationToken);
+            }
+            else if (key == "cold")
+            {
+                _coldStarted.Set();
+                _releaseCold.Wait(cancellationToken);
+            }
+        }
+
+        public void ReleaseCold() => _releaseCold.Set();
+
+        public void ReleaseAll()
+        {
+            _releaseHot.Set();
+            _releaseCold.Set();
+        }
+
+        public void Dispose()
+        {
+            _hotStarted.Dispose();
+            _coldStarted.Dispose();
+            _releaseHot.Dispose();
+            _releaseCold.Dispose();
         }
     }
 
