@@ -5,19 +5,17 @@ namespace MessageDispatching;
 
 public sealed class MessageDispatcher<TInput, TOutput> : IAsyncDisposable
 {
-    private const long NoScaleUpTimestamp = long.MinValue;
-
-    private enum WorkerWaitResult
+    private sealed class WorkerRegistration : IDisposable
     {
-        WorkAvailable,
-        Completed,
-        Retired
-    }
+        public readonly CancellationTokenSource RetirementCts = new();
+        public Task WorkerTask { get; set; } = Task.CompletedTask;
+        public bool IsWaiting;
+        public bool RetirementCommitted;
+        public int PreviousWorkerCount;
+        public int CurrentWorkerCount;
 
-    private readonly record struct WorkerWaitOutcome(
-        WorkerWaitResult Result,
-        int PreviousWorkerCount = 0,
-        int CurrentWorkerCount = 0);
+        public void Dispose() => RetirementCts.Dispose();
+    }
 
     private sealed class Subscription : IDisposable
     {
@@ -50,17 +48,17 @@ public sealed class MessageDispatcher<TInput, TOutput> : IAsyncDisposable
     private readonly object _lifetimeLock = new();
     private readonly object _workersLock = new();
     private readonly object _subscribersLock = new();
-    private readonly List<Task> _workers = new();
+    private readonly List<WorkerRegistration> _workers = new();
+    private readonly DynamicScalingPolicy? _scalingPolicy;
     private readonly bool _singleWorkerMode;
     private readonly bool _dynamicScalingEnabled;
+    private WorkerRegistration? _pendingRetirement;
     private Task? _scaleController;
 
     private int _pendingMessages;
     private int _queuedWorkItemCount;
     private int _workerCount;
     private int _busyWorkers;
-    private int _scaleUpCandidateSamples;
-    private long _lastScaleUpTimestamp = NoScaleUpTimestamp;
     private IMessageTransformer<TInput, TOutput>? _transformer;
     private IMessageSubscriber<TOutput>[] _subscribers = [];
     private bool _started;
@@ -76,6 +74,9 @@ public sealed class MessageDispatcher<TInput, TOutput> : IAsyncDisposable
 
         _singleWorkerMode = _options.EffectiveMaxParallelism == 1;
         _dynamicScalingEnabled = _options.IsDynamicScalingEnabled && !_singleWorkerMode;
+        _scalingPolicy = _dynamicScalingEnabled
+            ? new DynamicScalingPolicy(_options)
+            : null;
 
         _queue = Channel.CreateUnbounded<TInput>(
             new UnboundedChannelOptions
@@ -260,7 +261,7 @@ public sealed class MessageDispatcher<TInput, TOutput> : IAsyncDisposable
                     return;
                 }
 
-                SampleScaleUp();
+                SampleScale();
             }
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
@@ -268,45 +269,174 @@ public sealed class MessageDispatcher<TInput, TOutput> : IAsyncDisposable
         }
     }
 
-    private async Task WorkerLoopAsync(CancellationToken cancellationToken)
+    private void SampleScale()
     {
-        var counted = true;
+        WorkerRegistration? retirement = null;
+        var notifyScaleUp = false;
+        var previousWorkerCount = 0;
+        var currentWorkerCount = 0;
+        var currentTimestamp = Stopwatch.GetTimestamp();
+        var scalingPolicy = _scalingPolicy ??
+            throw new InvalidOperationException("Dynamic scaling is not enabled.");
+
+        lock (_workersLock)
+        {
+            PruneCompletedWorkersCore();
+
+            var workerCount = Volatile.Read(ref _workerCount);
+            var busyWorkers = Volatile.Read(ref _busyWorkers);
+            var queuedWorkItems = Volatile.Read(ref _queuedWorkItemCount);
+            var decision = scalingPolicy.Observe(
+                workerCount,
+                busyWorkers,
+                queuedWorkItems,
+                _pendingRetirement is not null,
+                currentTimestamp);
+
+            if (decision == DynamicScaleDecision.ScaleUp)
+            {
+                workerCount = Volatile.Read(ref _workerCount);
+                busyWorkers = Volatile.Read(ref _busyWorkers);
+                queuedWorkItems = Volatile.Read(ref _queuedWorkItemCount);
+
+                if (Volatile.Read(ref _disposed) ||
+                    workerCount >= _options.EffectiveMaxParallelism ||
+                    busyWorkers < workerCount ||
+                    queuedWorkItems <= 0 ||
+                    _pendingRetirement is not null)
+                {
+                    return;
+                }
+
+                currentWorkerCount = StartWorkerCore();
+                previousWorkerCount = currentWorkerCount - 1;
+                scalingPolicy.RecordScaleChange(currentTimestamp);
+                notifyScaleUp = true;
+            }
+            else if (decision == DynamicScaleDecision.ScaleDown)
+            {
+                workerCount = Volatile.Read(ref _workerCount);
+                busyWorkers = Volatile.Read(ref _busyWorkers);
+                queuedWorkItems = Volatile.Read(ref _queuedWorkItemCount);
+
+                if (Volatile.Read(ref _disposed) ||
+                    workerCount <= _options.Parallelism ||
+                    busyWorkers >= workerCount ||
+                    queuedWorkItems != 0 ||
+                    _pendingRetirement is not null)
+                {
+                    return;
+                }
+
+                retirement = _workers.FirstOrDefault(
+                    worker => worker.IsWaiting &&
+                        !worker.RetirementCommitted &&
+                        !worker.WorkerTask.IsCompleted);
+                if (retirement is null)
+                {
+                    return;
+                }
+
+                previousWorkerCount = workerCount;
+                currentWorkerCount = Interlocked.Decrement(ref _workerCount);
+                retirement.PreviousWorkerCount = previousWorkerCount;
+                retirement.CurrentWorkerCount = currentWorkerCount;
+                _pendingRetirement = retirement;
+                Volatile.Write(ref retirement.RetirementCommitted, true);
+                scalingPolicy.RecordScaleChange(currentTimestamp);
+            }
+        }
+
+        if (retirement is not null)
+        {
+            try
+            {
+                retirement.RetirementCts.Cancel();
+            }
+            catch (ObjectDisposedException)
+            {
+                // The selected worker already observed the committed retirement and was pruned.
+            }
+        }
+
+        if (notifyScaleUp)
+        {
+            NotifyScaleCompleted(previousWorkerCount, currentWorkerCount);
+        }
+    }
+
+    private async Task WorkerLoopAsync(
+        WorkerRegistration registration,
+        CancellationToken cancellationToken)
+    {
+        using var waitCts = CancellationTokenSource.CreateLinkedTokenSource(
+            cancellationToken,
+            registration.RetirementCts.Token);
 
         try
         {
-            while (true)
+            while (!Volatile.Read(ref registration.RetirementCommitted))
             {
                 while (_queue.Reader.TryRead(out var input))
                 {
                     ProcessQueuedInput(input, cancellationToken);
                 }
 
-                var waitOutcome = await WaitForWorkOrRetireAsync(cancellationToken).ConfigureAwait(false);
-                if (waitOutcome.Result == WorkerWaitResult.WorkAvailable)
+                if (Volatile.Read(ref registration.RetirementCommitted))
                 {
-                    continue;
+                    return;
                 }
 
-                if (waitOutcome.Result == WorkerWaitResult.Retired)
+                SetWorkerWaiting(registration, true);
+                try
                 {
-                    counted = false;
-                    NotifyScaleCompleted(
-                        waitOutcome.PreviousWorkerCount,
-                        waitOutcome.CurrentWorkerCount);
+                    if (!await _queue.Reader.WaitToReadAsync(waitCts.Token).ConfigureAwait(false))
+                    {
+                        return;
+                    }
                 }
-
-                return;
+                finally
+                {
+                    SetWorkerWaiting(registration, false);
+                }
             }
         }
-        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        catch (OperationCanceledException) when (
+            cancellationToken.IsCancellationRequested ||
+            registration.RetirementCts.IsCancellationRequested)
         {
         }
         finally
         {
-            if (counted)
+            if (Volatile.Read(ref registration.RetirementCommitted))
             {
-                Interlocked.Decrement(ref _workerCount);
+                NotifyScaleCompleted(
+                    registration.PreviousWorkerCount,
+                    registration.CurrentWorkerCount);
+
+                lock (_workersLock)
+                {
+                    if (ReferenceEquals(_pendingRetirement, registration))
+                    {
+                        _pendingRetirement = null;
+                    }
+                }
             }
+            else
+            {
+                lock (_workersLock)
+                {
+                    Interlocked.Decrement(ref _workerCount);
+                }
+            }
+        }
+    }
+
+    private void SetWorkerWaiting(WorkerRegistration registration, bool isWaiting)
+    {
+        lock (_workersLock)
+        {
+            registration.IsWaiting = isWaiting;
         }
     }
 
@@ -328,37 +458,6 @@ public sealed class MessageDispatcher<TInput, TOutput> : IAsyncDisposable
         finally
         {
             Interlocked.Decrement(ref _workerCount);
-        }
-    }
-
-    private async ValueTask<WorkerWaitOutcome> WaitForWorkOrRetireAsync(CancellationToken cancellationToken)
-    {
-        while (true)
-        {
-            if (!_dynamicScalingEnabled ||
-                Volatile.Read(ref _workerCount) <= _options.Parallelism)
-            {
-                return await _queue.Reader.WaitToReadAsync(cancellationToken).ConfigureAwait(false)
-                    ? new WorkerWaitOutcome(WorkerWaitResult.WorkAvailable)
-                    : new WorkerWaitOutcome(WorkerWaitResult.Completed);
-            }
-
-            using var idleCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-            idleCts.CancelAfter(_options.ScaleDownIdleDuration);
-
-            try
-            {
-                return await _queue.Reader.WaitToReadAsync(idleCts.Token).ConfigureAwait(false)
-                    ? new WorkerWaitOutcome(WorkerWaitResult.WorkAvailable)
-                    : new WorkerWaitOutcome(WorkerWaitResult.Completed);
-            }
-            catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
-            {
-                if (TryRetireIdleWorker(out var outcome))
-                {
-                    return outcome;
-                }
-            }
         }
     }
 
@@ -400,58 +499,6 @@ public sealed class MessageDispatcher<TInput, TOutput> : IAsyncDisposable
         }
     }
 
-    private void SampleScaleUp()
-    {
-        if (!_dynamicScalingEnabled)
-        {
-            return;
-        }
-
-        var workerCount = Volatile.Read(ref _workerCount);
-        var maxParallelism = _options.EffectiveMaxParallelism;
-
-        if (workerCount >= maxParallelism ||
-            !IsScaleUpCandidate(workerCount))
-        {
-            Interlocked.Exchange(ref _scaleUpCandidateSamples, 0);
-            return;
-        }
-
-        if (Interlocked.Increment(ref _scaleUpCandidateSamples) < _options.ScaleUpConsecutiveSamples)
-        {
-            return;
-        }
-
-        var currentTimestamp = Stopwatch.GetTimestamp();
-        if (!IsScaleUpCooldownElapsed(currentTimestamp))
-        {
-            return;
-        }
-
-        int currentWorkerCount;
-
-        lock (_workersLock)
-        {
-            PruneCompletedWorkersCore();
-            workerCount = Volatile.Read(ref _workerCount);
-            currentTimestamp = Stopwatch.GetTimestamp();
-
-            if (Volatile.Read(ref _disposed) ||
-                workerCount >= maxParallelism ||
-                !IsScaleUpCandidate(workerCount) ||
-                !IsScaleUpCooldownElapsed(currentTimestamp))
-            {
-                return;
-            }
-
-            currentWorkerCount = StartWorkerCore();
-            Volatile.Write(ref _lastScaleUpTimestamp, currentTimestamp);
-            Interlocked.Exchange(ref _scaleUpCandidateSamples, 0);
-        }
-
-        NotifyScaleCompleted(currentWorkerCount - 1, currentWorkerCount);
-    }
-
     private void NotifyScaleCompleted(int previousWorkerCount, int currentWorkerCount)
     {
         if (_scaleObserver is null)
@@ -473,65 +520,21 @@ public sealed class MessageDispatcher<TInput, TOutput> : IAsyncDisposable
         }
     }
 
-    private bool IsScaleUpCandidate(int workerCount)
-    {
-        if (workerCount <= 0)
-        {
-            return false;
-        }
-
-        return Volatile.Read(ref _busyWorkers) >= workerCount &&
-            Volatile.Read(ref _queuedWorkItemCount) > _options.ScaleUpQueuedWorkItemsThreshold;
-    }
-
-    private bool IsScaleUpCooldownElapsed(long currentTimestamp)
-    {
-        var lastScaleUpTimestamp = Volatile.Read(ref _lastScaleUpTimestamp);
-        if (lastScaleUpTimestamp == NoScaleUpTimestamp)
-        {
-            return true;
-        }
-
-        return Stopwatch.GetElapsedTime(lastScaleUpTimestamp, currentTimestamp) >=
-            _options.ScaleUpCooldown;
-    }
-
     private int StartWorkerCore()
     {
         PruneCompletedWorkersCore();
 
+        var registration = new WorkerRegistration();
         var workerCount = Interlocked.Increment(ref _workerCount);
         // Task.Run, not a direct call: an async method runs synchronously until its first real
         // await, and the worker loop starts by draining the queue. Called directly from
-        // SampleScaleUp it would execute transformers on the timer thread while holding
+        // the scale controller it would execute transformers on the timer thread while holding
         // _workersLock, blocking scaling decisions and CompleteAsync/DisposeAsync.
-        var worker = _singleWorkerMode
+        registration.WorkerTask = _singleWorkerMode
             ? Task.Run(() => SingleWorkerLoopAsync(_stopCts.Token))
-            : Task.Run(() => WorkerLoopAsync(_stopCts.Token));
-        _workers.Add(worker);
+            : Task.Run(() => WorkerLoopAsync(registration, _stopCts.Token));
+        _workers.Add(registration);
         return workerCount;
-    }
-
-    private bool TryRetireIdleWorker(out WorkerWaitOutcome outcome)
-    {
-        lock (_workersLock)
-        {
-            if (Volatile.Read(ref _workerCount) <= _options.Parallelism ||
-                Volatile.Read(ref _pendingMessages) != 0 ||
-                Volatile.Read(ref _queuedWorkItemCount) != 0 ||
-                Volatile.Read(ref _disposed))
-            {
-                outcome = default;
-                return false;
-            }
-
-            var currentWorkerCount = Interlocked.Decrement(ref _workerCount);
-            outcome = new WorkerWaitOutcome(
-                WorkerWaitResult.Retired,
-                currentWorkerCount + 1,
-                currentWorkerCount);
-            return true;
-        }
     }
 
     private Task[] GetWorkerSnapshot()
@@ -539,7 +542,7 @@ public sealed class MessageDispatcher<TInput, TOutput> : IAsyncDisposable
         lock (_workersLock)
         {
             PruneCompletedWorkersCore();
-            return _workers.ToArray();
+            return _workers.Select(worker => worker.WorkerTask).ToArray();
         }
     }
 
@@ -547,8 +550,10 @@ public sealed class MessageDispatcher<TInput, TOutput> : IAsyncDisposable
     {
         for (var i = _workers.Count - 1; i >= 0; i--)
         {
-            if (_workers[i].IsCompleted)
+            var worker = _workers[i];
+            if (worker.WorkerTask.IsCompleted)
             {
+                worker.Dispose();
                 _workers.RemoveAt(i);
             }
         }

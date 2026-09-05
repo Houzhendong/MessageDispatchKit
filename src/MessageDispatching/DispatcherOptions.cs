@@ -2,6 +2,10 @@ namespace MessageDispatching;
 
 public sealed class DispatcherOptions
 {
+    private const int MaximumObservationSamples = 1_000_000;
+    private static readonly TimeSpan MaximumTimerInterval =
+        TimeSpan.FromMilliseconds(uint.MaxValue - 1d);
+
     public int Parallelism { get; init; } = Math.Max(1, Environment.ProcessorCount);
 
     public int MaxParallelism { get; init; }
@@ -12,13 +16,15 @@ public sealed class DispatcherOptions
 
     public TimeSpan ScaleInterval { get; init; } = TimeSpan.FromMilliseconds(200);
 
+    public TimeSpan ScaleObservationWindow { get; init; } = TimeSpan.FromSeconds(2);
+
+    public double ScaleUpSaturationThreshold { get; init; } = 0.80;
+
+    public double ScaleDownUtilizationThreshold { get; init; } = 0.70;
+
     public TimeSpan ScaleUpCooldown { get; init; } = TimeSpan.FromSeconds(1);
 
-    public TimeSpan ScaleDownIdleDuration { get; init; } = TimeSpan.FromSeconds(30);
-
-    public int ScaleUpQueuedWorkItemsThreshold { get; init; }
-
-    public int ScaleUpConsecutiveSamples { get; init; } = 2;
+    public TimeSpan ScaleDownCooldown { get; init; } = TimeSpan.FromSeconds(2);
 
     internal int EffectiveMaxParallelism => MaxParallelism == 0 ? Parallelism : MaxParallelism;
 
@@ -50,11 +56,60 @@ public sealed class DispatcherOptions
                 "MaxParallelism must be zero or greater than or equal to Parallelism.");
         }
 
-        if (ScaleInterval <= TimeSpan.Zero)
+        if (ScaleInterval <= TimeSpan.Zero || ScaleInterval > MaximumTimerInterval)
         {
             throw new ArgumentOutOfRangeException(
                 nameof(ScaleInterval),
-                "ScaleInterval must be greater than zero.");
+                $"ScaleInterval must be greater than zero and no greater than {MaximumTimerInterval}.");
+        }
+
+        // Compare by division rather than multiplying ScaleInterval, because doubling a valid
+        // TimeSpan near TimeSpan.MaxValue can overflow before the comparison is made.
+        if (ScaleObservationWindow <= TimeSpan.Zero ||
+            ScaleObservationWindow > MaximumTimerInterval ||
+            ScaleInterval.Ticks > ScaleObservationWindow.Ticks / 2)
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(ScaleObservationWindow),
+                $"ScaleObservationWindow must be at least twice ScaleInterval and no greater than {MaximumTimerInterval}.");
+        }
+
+        var sampleCapacity = ScaleObservationWindow.Ticks / ScaleInterval.Ticks;
+        if (ScaleObservationWindow.Ticks % ScaleInterval.Ticks != 0)
+        {
+            sampleCapacity++;
+        }
+
+        if (sampleCapacity > MaximumObservationSamples)
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(ScaleObservationWindow),
+                $"ScaleObservationWindow cannot contain more than {MaximumObservationSamples} ScaleInterval samples.");
+        }
+
+        if (!double.IsFinite(ScaleUpSaturationThreshold) ||
+            ScaleUpSaturationThreshold <= 0 ||
+            ScaleUpSaturationThreshold > 1)
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(ScaleUpSaturationThreshold),
+                "ScaleUpSaturationThreshold must be finite and greater than zero and no greater than one.");
+        }
+
+        if (!double.IsFinite(ScaleDownUtilizationThreshold) ||
+            ScaleDownUtilizationThreshold < 0 ||
+            ScaleDownUtilizationThreshold >= 1)
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(ScaleDownUtilizationThreshold),
+                "ScaleDownUtilizationThreshold must be finite, zero or greater, and less than one.");
+        }
+
+        if (ScaleDownUtilizationThreshold >= ScaleUpSaturationThreshold)
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(ScaleDownUtilizationThreshold),
+                "ScaleDownUtilizationThreshold must be less than ScaleUpSaturationThreshold.");
         }
 
         if (ScaleUpCooldown < TimeSpan.Zero)
@@ -64,25 +119,11 @@ public sealed class DispatcherOptions
                 "ScaleUpCooldown must be zero or greater.");
         }
 
-        if (ScaleDownIdleDuration <= TimeSpan.Zero)
+        if (ScaleDownCooldown < TimeSpan.Zero)
         {
             throw new ArgumentOutOfRangeException(
-                nameof(ScaleDownIdleDuration),
-                "ScaleDownIdleDuration must be greater than zero.");
-        }
-
-        if (ScaleUpQueuedWorkItemsThreshold < 0)
-        {
-            throw new ArgumentOutOfRangeException(
-                nameof(ScaleUpQueuedWorkItemsThreshold),
-                "ScaleUpQueuedWorkItemsThreshold must be zero or greater.");
-        }
-
-        if (ScaleUpConsecutiveSamples <= 0)
-        {
-            throw new ArgumentOutOfRangeException(
-                nameof(ScaleUpConsecutiveSamples),
-                "ScaleUpConsecutiveSamples must be greater than zero.");
+                nameof(ScaleDownCooldown),
+                "ScaleDownCooldown must be zero or greater.");
         }
     }
 }

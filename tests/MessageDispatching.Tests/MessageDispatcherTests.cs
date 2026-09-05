@@ -40,12 +40,7 @@ public sealed class MessageDispatcherTests
             new DispatcherOptions
             {
                 Parallelism = 1,
-                MaxParallelism = 1,
-                ScaleInterval = TimeSpan.FromMilliseconds(1),
-                ScaleUpCooldown = TimeSpan.Zero,
-                ScaleDownIdleDuration = TimeSpan.FromMilliseconds(1),
-                ScaleUpQueuedWorkItemsThreshold = 0,
-                ScaleUpConsecutiveSamples = 1
+                MaxParallelism = 1
             });
 
         using var subscription = dispatcher.Subscribe(subscriber);
@@ -107,88 +102,34 @@ public sealed class MessageDispatcherTests
     }
 
     [Fact]
-    public async Task DynamicWorkersScaleUpAndBackDown()
+    public async Task DynamicWorkersScaleToMaxAndBackDown()
     {
         var transformer = new DelayingTransformer(TimeSpan.FromMilliseconds(25));
         var subscriber = new RecordingSubscriber();
+        var scaleChanges = new ConcurrentQueue<DispatcherScaleChange>();
         await using var dispatcher = new MessageDispatcher<int, string>(
-            new DispatcherOptions
-            {
-                Parallelism = 1,
-                MaxParallelism = 4,
-                ScaleInterval = TimeSpan.FromMilliseconds(5),
-                ScaleUpCooldown = TimeSpan.FromMilliseconds(5),
-                ScaleDownIdleDuration = TimeSpan.FromMilliseconds(50),
-                ScaleUpQueuedWorkItemsThreshold = 1,
-                ScaleUpConsecutiveSamples = 1
-            });
+            CreateDynamicOptions(1, 4, scaleChanges.Enqueue));
 
         using var subscription = dispatcher.Subscribe(subscriber);
         dispatcher.Start(transformer);
 
-        for (var i = 0; i < 40; i++)
+        for (var i = 0; i < 80; i++)
         {
             dispatcher.Enqueue(i);
         }
 
-        await TestWait.UntilAsync(() => dispatcher.GetStats().WorkerCount > 1);
+        await TestWait.UntilAsync(() => dispatcher.GetStats().WorkerCount == 4);
         await TestWait.UntilAsync(() => dispatcher.GetStats().PendingMessages == 0);
         await TestWait.UntilAsync(() => dispatcher.GetStats().WorkerCount == 1);
 
         Assert.True(transformer.MaxConcurrency > 1);
-        Assert.Equal(40, subscriber.Messages.Count);
+        Assert.Equal(80, subscriber.Messages.Count);
+        Assert.All(
+            scaleChanges,
+            change => Assert.Equal(1, Math.Abs(change.CurrentWorkerCount - change.PreviousWorkerCount)));
+        Assert.DoesNotContain(scaleChanges, change => change.CurrentWorkerCount > 4);
 
         await dispatcher.CompleteAsync();
-    }
-
-    [Fact]
-    public async Task ScaleUpRequiresQueuedWorkItemsToExceedThreshold()
-    {
-        using var transformer = new GatedTransformer();
-        await using var dispatcher = new MessageDispatcher<int, string>(
-            new DispatcherOptions
-            {
-                Parallelism = 1,
-                MaxParallelism = 2,
-                ScaleInterval = TimeSpan.FromMilliseconds(10),
-                ScaleUpCooldown = TimeSpan.FromDays(365),
-                ScaleDownIdleDuration = TimeSpan.FromSeconds(10),
-                ScaleUpQueuedWorkItemsThreshold = 1,
-                ScaleUpConsecutiveSamples = 1
-            });
-
-        dispatcher.Start(transformer);
-
-        try
-        {
-            dispatcher.Enqueue(0);
-            await TestWait.UntilAsync(() => transformer.FirstStarted);
-            await TestWait.UntilAsync(() =>
-            {
-                var stats = dispatcher.GetStats();
-                return stats.WorkerCount == 1 &&
-                    stats.BusyWorkers == 1 &&
-                    stats.QueuedWorkItems == 0;
-            });
-
-            dispatcher.Enqueue(1);
-            await TestWait.UntilAsync(() => dispatcher.GetStats().QueuedWorkItems == 1);
-
-            await Task.Delay(TimeSpan.FromMilliseconds(100));
-
-            var boundaryStats = dispatcher.GetStats();
-            Assert.Equal(1, boundaryStats.WorkerCount);
-            Assert.Equal(1, boundaryStats.BusyWorkers);
-            Assert.Equal(1, boundaryStats.QueuedWorkItems);
-
-            dispatcher.Enqueue(2);
-            await TestWait.UntilAsync(() => dispatcher.GetStats().WorkerCount == 2);
-        }
-        finally
-        {
-            transformer.Release();
-            await dispatcher.CompleteAsync();
-        }
     }
 
     [Fact]
@@ -198,21 +139,14 @@ public sealed class MessageDispatcherTests
         var subscriber = new RecordingSubscriber();
         var scaleChanges = new ConcurrentQueue<DispatcherScaleChange>();
         await using var dispatcher = new MessageDispatcher<int, string>(
-            new DispatcherOptions
-            {
-                Parallelism = 1,
-                MaxParallelism = 2,
-                ScaleInterval = TimeSpan.FromMilliseconds(5),
-                ScaleUpCooldown = TimeSpan.FromMilliseconds(5),
-                ScaleDownIdleDuration = TimeSpan.FromMilliseconds(50),
-                ScaleUpQueuedWorkItemsThreshold = 0,
-                ScaleUpConsecutiveSamples = 1,
-                ScaleObserver = change =>
+            CreateDynamicOptions(
+                1,
+                2,
+                change =>
                 {
                     scaleChanges.Enqueue(change);
                     throw new InvalidOperationException("Expected scale observer failure.");
-                }
-            });
+                }));
 
         using var subscription = dispatcher.Subscribe(subscriber);
         dispatcher.Start(transformer);
@@ -240,13 +174,86 @@ public sealed class MessageDispatcherTests
         Assert.Equal(1, scaleDown.CurrentWorkerCount);
         Assert.False(scaleDown.IsScaleUp);
         Assert.Equal(1, scaleDown.Stats.WorkerCount);
-        Assert.Equal(0, scaleDown.Stats.PendingMessages);
         Assert.Equal(0, scaleDown.Stats.QueuedWorkItems);
         Assert.Equal(20, subscriber.Messages.Count);
 
         await dispatcher.CompleteAsync();
 
         Assert.Equal(2, scaleChanges.Count);
+    }
+
+    [Fact]
+    public async Task DynamicWorkersRetireWhileOneInputRemainsActive()
+    {
+        using var transformer = new SelectiveGatedTransformer();
+        var scaleChanges = new ConcurrentQueue<DispatcherScaleChange>();
+        await using var dispatcher = new MessageDispatcher<int, string>(
+            CreateDynamicOptions(1, 3, scaleChanges.Enqueue));
+
+        dispatcher.Start(transformer);
+
+        try
+        {
+            dispatcher.Enqueue(0);
+            for (var i = 1; i <= 6; i++)
+            {
+                dispatcher.Enqueue(i);
+            }
+
+            await TestWait.UntilAsync(() => dispatcher.GetStats().WorkerCount == 3);
+            await TestWait.UntilAsync(() => transformer.StartedCount >= 3);
+
+            transformer.ReleaseCold();
+
+            await TestWait.UntilAsync(() =>
+            {
+                var stats = dispatcher.GetStats();
+                return stats.WorkerCount == 1 &&
+                    stats.BusyWorkers == 1 &&
+                    stats.QueuedWorkItems == 0 &&
+                    stats.PendingMessages == 1;
+            });
+
+            await TestWait.UntilAsync(
+                () => scaleChanges.Any(
+                    change => !change.IsScaleUp && change.CurrentWorkerCount == 1));
+
+            Assert.False(transformer.HotCancellationRequested);
+            Assert.Contains(
+                scaleChanges,
+                change => !change.IsScaleUp && change.CurrentWorkerCount == 1);
+        }
+        finally
+        {
+            transformer.ReleaseAll();
+            await dispatcher.CompleteAsync();
+        }
+    }
+
+    [Fact]
+    public async Task CompleteWhileBackloggedStillScalesAndDrains()
+    {
+        var transformer = new DelayingTransformer(TimeSpan.FromMilliseconds(25));
+        var subscriber = new RecordingSubscriber();
+        var scaleChanges = new ConcurrentQueue<DispatcherScaleChange>();
+        await using var dispatcher = new MessageDispatcher<int, string>(
+            CreateDynamicOptions(1, 3, scaleChanges.Enqueue));
+
+        using var subscription = dispatcher.Subscribe(subscriber);
+        dispatcher.Start(transformer);
+
+        for (var i = 0; i < 60; i++)
+        {
+            dispatcher.Enqueue(i);
+        }
+
+        await dispatcher.CompleteAsync();
+
+        Assert.Contains(scaleChanges, change => change.IsScaleUp);
+        Assert.Equal(60, subscriber.Messages.Count);
+        Assert.Equal(0, dispatcher.GetStats().PendingMessages);
+        Assert.Equal(0, dispatcher.GetStats().WorkerCount);
+        Assert.False(dispatcher.GetStats().IsAccepting);
     }
 
     [Fact]
@@ -291,26 +298,66 @@ public sealed class MessageDispatcherTests
         Assert.Equal(1, transformer.MaxConcurrency);
     }
 
-    private sealed class GatedTransformer : IMessageTransformer<int, string>, IDisposable
+    private static DispatcherOptions CreateDynamicOptions(
+        int parallelism,
+        int maxParallelism,
+        Action<DispatcherScaleChange>? scaleObserver = null)
     {
-        private readonly ManualResetEventSlim _firstStarted = new();
-        private readonly ManualResetEventSlim _release = new();
+        return new DispatcherOptions
+        {
+            Parallelism = parallelism,
+            MaxParallelism = maxParallelism,
+            ScaleInterval = TimeSpan.FromMilliseconds(20),
+            ScaleObservationWindow = TimeSpan.FromMilliseconds(100),
+            ScaleUpSaturationThreshold = 0.80,
+            ScaleDownUtilizationThreshold = 0.70,
+            ScaleUpCooldown = TimeSpan.FromMilliseconds(20),
+            ScaleDownCooldown = TimeSpan.FromMilliseconds(40),
+            ScaleObserver = scaleObserver
+        };
+    }
 
-        public bool FirstStarted => _firstStarted.IsSet;
+    private sealed class SelectiveGatedTransformer : IMessageTransformer<int, string>, IDisposable
+    {
+        private readonly ManualResetEventSlim _releaseHot = new();
+        private readonly ManualResetEventSlim _releaseCold = new();
+        private int _startedCount;
+        private int _hotCancellationRequested;
+
+        public int StartedCount => Volatile.Read(ref _startedCount);
+
+        public bool HotCancellationRequested => Volatile.Read(ref _hotCancellationRequested) != 0;
 
         public string Transform(int input, CancellationToken cancellationToken)
         {
-            _firstStarted.Set();
-            _release.Wait(cancellationToken);
+            Interlocked.Increment(ref _startedCount);
+
+            if (input == 0)
+            {
+                using var registration = cancellationToken.Register(
+                    () => Volatile.Write(ref _hotCancellationRequested, 1));
+                _releaseHot.Wait(cancellationToken);
+            }
+            else
+            {
+                _releaseCold.Wait(cancellationToken);
+            }
+
             return $"parsed-{input}";
         }
 
-        public void Release() => _release.Set();
+        public void ReleaseCold() => _releaseCold.Set();
+
+        public void ReleaseAll()
+        {
+            _releaseHot.Set();
+            _releaseCold.Set();
+        }
 
         public void Dispose()
         {
-            _firstStarted.Dispose();
-            _release.Dispose();
+            _releaseHot.Dispose();
+            _releaseCold.Dispose();
         }
     }
 

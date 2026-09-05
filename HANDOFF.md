@@ -25,6 +25,7 @@ src/
     DispatcherOptions.cs
     DispatcherStats.cs
     DispatcherScaleChange.cs
+    DynamicScalingPolicy.cs
     IKeyedMessageHandler.cs
     IMessageTransformer.cs
     IMessageSubscriber.cs
@@ -39,6 +40,8 @@ samples/
 tests/
   MessageDispatching.Tests/
     MessageDispatching.Tests.csproj
+    DispatcherOptionsTests.cs
+    DynamicScalingPolicyTests.cs
     KeyedOrderedDispatcherTests.cs
     MessageDispatcherTests.cs
     TestWait.cs
@@ -67,6 +70,10 @@ tests/
   - `KeyedOrderedDispatcher` 和 `MessageDispatcher` 共享的动态扩缩容通知数据。
   - 包含扩缩容前后的 worker 数、方向判断及通知时的 stats 快照。
 
+- `DynamicScalingPolicy.cs`
+  - 两个 dispatcher 共享的内部滚动窗口扩缩容决策器。
+  - 聚合利用率和饱和占空比，不负责启动、取消或等待 worker。
+
 - `samples/DispatcherSample/Program.cs`
   - 可运行示例。
   - 演示多个热点 key 不会因为固定 hash 分区而互相阻塞。
@@ -85,8 +92,8 @@ hash(key) % partitionCount -> 固定 partition -> 固定 worker
 当前实现使用动态调度模型：
 
 ```text
-每个 key 一个 SPSC unbounded channel 队列
-全局 bounded ready key 队列，容量为 `EffectiveMaxParallelism`
+每个 key 一个单读者、多写者 unbounded channel 队列
+全局 unbounded ready key 队列，每个 active key 至多一个 token
 全局 worker pool，可选动态扩容
 同一时刻一个 key 最多只被一个 worker 处理
 不同 key 可以被不同 worker 并行处理
@@ -94,11 +101,11 @@ hash(key) % partitionCount -> 固定 partition -> 固定 worker
 
 每个 `KeyState` 的并发细节：
 
-- 队列是 `SingleReader=true, SingleWriter=true` 的 unbounded channel。
+- 队列是 `SingleReader=true, SingleWriter=false` 的 unbounded channel，同一 key 可以由多个生产者并发 `Enqueue`。
 - 用 CAS（`Interlocked.CompareExchange`）实现自旋锁，`Acquire()` 返回 `IDisposable`，配合 `using` 进出临界区。
-- 上游保证同一 key 单线程写入（满足 channel 的 single-writer 契约），`Active` 标志保证同一 key 至多一个消费者（满足 single-reader 契约）。
+- `Active` 标志保证同一 key 至多一个消费者；并发生产者之间没有额外定义调用顺序，channel 实际接受后的消息由该单消费者顺序处理。
 - handler 调用和消费者 `TryRead` 排空都在锁外，不阻塞其他 key。
-- ready-key channel 使用 bounded channel，容量等于启用动态扩容后的最大 worker 数。热路径先 `TryWrite`，如果队列满则挂起异步 `WriteAsync` 等待槽位，避免 worker 在重调度时同步阻塞造成死锁。
+- ready-key channel 是 unbounded；`Active` 保证每个 key 至多存在一条调度链，因此 `ScheduleKey` 使用同步 `TryWrite`，只会在 writer 已完成后失败并回滚计数。
 - 调度判定不依赖 channel 自带的 `Reader.Count`（`SingleConsumerUnboundedChannel` 不支持），而是用 `KeyState.UnreservedMessages` 计数；worker 会先在临界区内预留最多 `KeyBatchSize` 条消息，再到锁外读取处理。
   - key 状态不再移除；`_states` 使用 copy-on-write `FrozenDictionary` 快照 cache，已知 key 的热路径只做无锁 `TryGetValue`，首次出现新 key 时才加锁重建并发布新快照。
 
@@ -221,7 +228,7 @@ MessageBus
 这样可以做到：
 
 - 不同 `MessageType` 之间隔离。
-- 每个 `MessageType` 独立配置并行度和积压上限。
+- 每个 `MessageType` 独立配置并行度并监控积压；需要限流或背压时在 dispatcher 外实现。
 - 每个 `MessageType` 独立定义 key 选择逻辑。
 - 每个 `MessageType` 独立处理错误、重试和死信。
 
@@ -248,19 +255,27 @@ Parallelism = 1,
 MaxParallelism = 4
 ```
 
-当前验证性实现支持扩容和空闲缩容。扩容条件是：
+当前实现使用同一个周期 controller 同时判断扩容和缩容，不再由各 worker 依赖一次连续空闲超时自行退出。每次采样计算：
 
-- 当前 worker 数小于 `MaxParallelism`。
-- `ScaleInterval` 周期采样中连续 `ScaleUpConsecutiveSamples` 次命中扩容条件。
-- 当前 worker 全部处于忙碌状态。
-- 已排队 work item 数严格大于 `ScaleUpQueuedWorkItemsThreshold`。
-- 距离上次扩容至少经过 `ScaleUpCooldown`。
+```text
+利用率 U = clamp(BusyWorkers / WorkerCount, 0..1)
+饱和样本 S = BusyWorkers >= WorkerCount && QueuedWorkItems > 0 ? 1 : 0
+```
 
-扩容不会破坏同 key 顺序，因为 `KeyState.Active` 仍保证同一时刻一个 key 至多被一个 worker 处理。
+controller 在 `ScaleObservationWindow` 滚动窗口中维护平均利用率和饱和占空比：
 
-`Complete()` 后如果仍有已入队消息待排空，controller 仍允许扩容；当 pending 归零或 `DisposeAsync()` 取消时 controller 退出。
+- 窗口按实际持续时间加权的饱和占空比达到 `ScaleUpSaturationThreshold`，且最新样本仍饱和时，增加一个 worker。
+- 窗口按实际持续时间加权的平均利用率低于或等于 `ScaleDownUtilizationThreshold`，且最新样本仍有空闲容量并且没有排队 work item 时，退休一个正在等待的 worker。
+- worker 数始终限制在 `Parallelism` floor 和 `MaxParallelism` ceiling 之间。
+- 两个方向每次都只调整一个 worker，并分别受 `ScaleUpCooldown` / `ScaleDownCooldown` 限制；cooldown 从最近一次任意方向的实际变化开始计算，避免刚扩即缩或刚缩即扩。
 
-缩容由空闲 worker 自愿退出完成，不会取消正在处理的 worker。worker 等待 work item 超过 `ScaleDownIdleDuration` 后，如果当前 worker 数大于 `Parallelism`，则尝试退出，缩容下限是 `Parallelism`。keyed dispatcher 在 `QueuedWorkItems == 0` 时即可退出；`PendingMessages` 可能只是串行堆积在 active hot key 后面，其他 worker 无法参与处理，因此不会阻止缩容。no-key dispatcher 仍要求 `PendingMessages == 0` 且 `QueuedWorkItems == 0`。
+keyed dispatcher 的 `QueuedWorkItems` 是 ready key 数，no-key dispatcher 中则是全局队列里未被领取的消息数。算法只使用“是否还有可立即并行的排队工作”，不会用 pending 或 queue 绝对值推导目标 worker 数，避免单个不可并行 hot key 的积压造成误判。
+
+keyed dispatcher 在 batch 结束时先减少 `BusyWorkers`、再重新调度仍有积压的 key，因此单 hot key 的 batch 边界不会同时形成 `BusyWorkers == WorkerCount` 和 `QueuedWorkItems > 0` 的虚假饱和样本。同 key 顺序仍由 `KeyState.Active` 保证。
+
+缩容只取消被 controller 选中的空闲 worker 的 channel 等待，不会把 retirement token 传给 handler、transformer 或 subscriber，也不会中断正在处理的用户代码。即使持续存在低速消息，只要窗口按实际持续时间加权的平均利用率足够低，额外 worker 仍可逐步退出，不再要求整个 dispatcher 出现完全静默窗口。
+
+`Complete()` 后如果仍有已入队消息待排空，controller 仍允许扩缩容；当 pending 归零或 `DisposeAsync()` 取消时 controller 退出。
 
 ### ScaleObserver（扩缩容观察回调）
 
@@ -289,47 +304,47 @@ observer 只报告动态扩缩容实际提交的单步 worker 数变化。`Start
 
 observer 同步运行在内部 scale controller 或 retiring worker 任务上，不切换到调用方的 `SynchronizationContext`。回调应保持快速、线程安全，不要在回调内同步等待同一个 dispatcher 关闭。observer 被当作单个不透明回调调用；它抛出的任何异常都会被 dispatcher 吞掉，不影响扩缩容状态、worker/controller 任务、后续消息处理、`CompleteAsync()` 或 `DisposeAsync()`。
 
-### ScaleInterval
+### ScaleInterval 与 ScaleObservationWindow
 
 ```csharp
-ScaleInterval = TimeSpan.FromMilliseconds(200)
+ScaleInterval = TimeSpan.FromMilliseconds(200),
+ScaleObservationWindow = TimeSpan.FromSeconds(2)
 ```
 
-动态扩容 controller 的采样间隔。扩容判断不在 `Enqueue` 或 ready-key 调度热路径上执行。
+controller 每隔 `ScaleInterval` 采样一次，扩容和缩容都根据最近 `ScaleObservationWindow` 的滚动统计做决定；window 至少要包含两个采样间隔。每段状态按实际持续时间加权并按 timestamp 裁剪，timer 延迟不会让过期样本继续影响决策；如果两次采样间隔超过整个 window，则丢弃旧历史重新积累。判断不在 `Enqueue` 或 ready-key 调度热路径上执行。
 
-### ScaleUpCooldown
+### ScaleUpSaturationThreshold
 
 ```csharp
-ScaleUpCooldown = TimeSpan.FromSeconds(1)
+ScaleUpSaturationThreshold = 0.80
 ```
 
-两次扩容之间的最小间隔，用于避免多路长连接持续推送时快速冲到 `MaxParallelism`。
+表示观测窗口中“所有 worker 都忙，并且仍有 work item 排队”的最小占空比。默认 `0.80` 要求大部分窗口都处于真实饱和状态，瞬时或低占空比的周期 burst 不会逐步积累扩容机会。阈值必须位于 `(0, 1]`。
 
-### ScaleDownIdleDuration
+### ScaleDownUtilizationThreshold
 
 ```csharp
-ScaleDownIdleDuration = TimeSpan.FromSeconds(30)
+ScaleDownUtilizationThreshold = 0.70
 ```
 
-超过该空闲时长后，额外 worker 会尝试缩容退出。只有空闲 worker 会退出，正在处理消息的 worker 不会被中断。
+表示触发缩容的最大窗口平均 worker 利用率。最新样本还必须同时满足存在空闲 worker 且 `QueuedWorkItems == 0`。默认值会在缩容后保留一定余量，但不要求 pending 清零或整个 channel 连续静默。阈值必须位于 `[0, 1)`，并严格小于扩容阈值以形成迟滞区间。
 
-### ScaleUpQueuedWorkItemsThreshold
+### ScaleUpCooldown 与 ScaleDownCooldown
 
 ```csharp
-ScaleUpQueuedWorkItemsThreshold = 0
+ScaleUpCooldown = TimeSpan.FromSeconds(1),
+ScaleDownCooldown = TimeSpan.FromSeconds(2)
 ```
 
-默认值为 `0`，必须为零或正数，负数无效。实际扩容条件使用严格比较：`QueuedWorkItems > ScaleUpQueuedWorkItemsThreshold`。因此默认配置下，只要所有当前 worker 都忙碌并且至少有一个 work item 排队，就满足这一项条件。
+两个方向每次都只调整一个 worker。对应 cooldown 限制下一次同方向决策的速度，但都从最近一次任意方向的实际 worker 数变化开始计算，因此也能抑制反向抖动。
 
-keyed dispatcher 中 `QueuedWorkItems` 表示 ready key 数；同一个 active key 后面串行积压的消息不会增加该值。no-key dispatcher 中 `QueuedWorkItems` 表示全局输入队列里尚未被 worker 取走的待转换消息数。
+### 旧配置迁移
 
-### ScaleUpConsecutiveSamples
+以下旧属性已删除：
 
-```csharp
-ScaleUpConsecutiveSamples = 2
-```
-
-扩容条件必须连续命中的采样次数，用于过滤瞬时尖峰。当前策略仍是验证性策略，后续可根据真实负载继续引入平均处理耗时或 pending 增长速率。
+- `ScaleDownIdleDuration`：由滚动利用率缩容和 `ScaleDownCooldown` 取代。
+- `ScaleUpQueuedWorkItemsThreshold`：由窗口饱和占空比取代；queued 仅作为“是否存在可并行排队工作”的布尔信号。
+- `ScaleUpConsecutiveSamples`：由 `ScaleObservationWindow` 和 `ScaleUpSaturationThreshold` 取代。
 
 ### 入队与背压
 
@@ -502,14 +517,15 @@ dotnet test .\tests\MessageDispatching.Tests\MessageDispatching.Tests.csproj
 
 ## 当前验证结果
 
-已执行 Release 配置的库构建、完整测试、示例构建和运行，并用 `--no-build` 将全部 8 个 scale-related 用例重复运行 10 次；最后执行 `git diff --check` 和 `git status --short`。
+已执行库构建、完整测试、示例构建和运行，并将完整测试套件连续运行 5 次；最后执行 `git diff --check` 和 `git status --short`。
 
 结果：
 
 - 库和示例编译通过，均为 0 warning、0 error。
-- xUnit 完整测试通过：25/25；8 个 scale-related 用例重复 10 次，每轮 8/8 通过。
+- xUnit 完整测试通过：57/57；连续 5 轮均为 57/57 通过。
+- 纯 policy 测试覆盖滚动窗口、低占空比重复 burst、合并 tick 导致的额外 ring-buffer 样本、零利用率阈值、双向 cooldown、长采样间隔重置、最新状态门槛和异常 gauge clamp。
 - 示例运行通过，每个 key 内部顺序保持递增，不同 key 实际发生并行处理。
-- keyed observer 同步输出扩容和缩容通知；本次观察到 worker 从 1 扩到 3，再缩到 1，其中一次缩容通知的 `PendingMessages` 仍大于 0。
-- no-key observer 同步输出扩容和缩容通知；本次观察到 worker 从 1 扩到 4，再缩到 1，24 条 raw packet 全部转换并发布。
+- keyed observer 同步输出扩容和缩容通知；本次观察到 worker 从 1 扩到 3，再缩到 1，其中缩容发生时 `PendingMessages` 仍大于 0。
+- no-key observer 同步输出扩容和缩容通知；本次观察到 worker 从 1 扩到 4，再在持续处理尾部消息时逐步缩到 1，24 条 raw packet 全部转换并发布。
 - no-key MPSC 验证通过：`Parallelism = 1` 且未启用动态扩容时，观察到 `no-key mpsc published count: 4`、`no-key mpsc max concurrency observed: 1`。
 - `git diff --check` 通过；仅输出 Git 的 LF/CRLF 工作区转换提示。
