@@ -100,89 +100,52 @@ public sealed class KeyedOrderedDispatcherTests
     }
 
     [Fact]
-    public async Task DynamicWorkersScaleUpAndBackDown()
+    public async Task DynamicWorkersScaleToMaxAndBackDown()
     {
-        var handler = new DelayingKeyedHandler(TimeSpan.FromMilliseconds(40));
+        var handler = new DelayingKeyedHandler(TimeSpan.FromMilliseconds(25));
+        var scaleChanges = new ConcurrentQueue<DispatcherScaleChange>();
         await using var dispatcher = new KeyedOrderedDispatcher<string, int>(
-            new DispatcherOptions
-            {
-                Parallelism = 1,
-                MaxParallelism = 4,
-                KeyBatchSize = 1,
-                ScaleInterval = TimeSpan.FromMilliseconds(5),
-                ScaleUpCooldown = TimeSpan.FromMilliseconds(5),
-                ScaleDownIdleDuration = TimeSpan.FromMilliseconds(50),
-                ScaleUpQueuedWorkItemsThreshold = 0,
-                ScaleUpConsecutiveSamples = 1
-            });
+            CreateDynamicOptions(1, 4, scaleChanges.Enqueue));
 
         dispatcher.Start(handler);
 
-        for (var i = 0; i < 20; i++)
+        for (var i = 0; i < 80; i++)
         {
-            dispatcher.Enqueue("a", i);
-            dispatcher.Enqueue("b", i);
-            dispatcher.Enqueue("c", i);
+            dispatcher.Enqueue($"key-{i % 8}", i);
         }
 
-        await TestWait.UntilAsync(() => dispatcher.GetStats().WorkerCount > 1);
+        await TestWait.UntilAsync(() => dispatcher.GetStats().WorkerCount == 4);
         await TestWait.UntilAsync(() => dispatcher.GetStats().PendingMessages == 0);
         await TestWait.UntilAsync(() => dispatcher.GetStats().WorkerCount == 1);
 
         Assert.True(handler.MaxConcurrency > 1);
+        Assert.All(
+            scaleChanges,
+            change => Assert.Equal(1, Math.Abs(change.CurrentWorkerCount - change.PreviousWorkerCount)));
+        Assert.DoesNotContain(scaleChanges, change => change.CurrentWorkerCount > 4);
 
         await dispatcher.CompleteAsync();
     }
 
     [Fact]
-    public async Task ScaleUpRequiresQueuedWorkItemsToExceedThreshold()
+    public async Task SingleHotKeyDoesNotScaleUpAtBatchBoundaries()
     {
-        using var handler = new BlockingKeyedHandler();
+        var handler = new DelayingKeyedHandler(TimeSpan.FromMilliseconds(5));
+        var scaleChanges = new ConcurrentQueue<DispatcherScaleChange>();
         await using var dispatcher = new KeyedOrderedDispatcher<string, int>(
-            new DispatcherOptions
-            {
-                Parallelism = 1,
-                MaxParallelism = 2,
-                KeyBatchSize = 1,
-                ScaleInterval = TimeSpan.FromMilliseconds(10),
-                ScaleUpCooldown = TimeSpan.FromDays(365),
-                ScaleDownIdleDuration = TimeSpan.FromSeconds(10),
-                ScaleUpQueuedWorkItemsThreshold = 1,
-                ScaleUpConsecutiveSamples = 1
-            });
+            CreateDynamicOptions(1, 4, scaleChanges.Enqueue));
 
         dispatcher.Start(handler);
 
-        try
+        for (var i = 0; i < 100; i++)
         {
-            dispatcher.Enqueue("active", 0);
-            await TestWait.UntilAsync(() => handler.FirstStarted);
-            await TestWait.UntilAsync(() =>
-            {
-                var stats = dispatcher.GetStats();
-                return stats.WorkerCount == 1 &&
-                    stats.BusyWorkers == 1 &&
-                    stats.QueuedWorkItems == 0;
-            });
-
-            dispatcher.Enqueue("queued-1", 1);
-            await TestWait.UntilAsync(() => dispatcher.GetStats().QueuedWorkItems == 1);
-
-            await Task.Delay(TimeSpan.FromMilliseconds(100));
-
-            var boundaryStats = dispatcher.GetStats();
-            Assert.Equal(1, boundaryStats.WorkerCount);
-            Assert.Equal(1, boundaryStats.BusyWorkers);
-            Assert.Equal(1, boundaryStats.QueuedWorkItems);
-
-            dispatcher.Enqueue("queued-2", 2);
-            await TestWait.UntilAsync(() => dispatcher.GetStats().WorkerCount == 2);
+            dispatcher.Enqueue("hot", i);
         }
-        finally
-        {
-            handler.Release();
-            await dispatcher.CompleteAsync();
-        }
+
+        await dispatcher.CompleteAsync();
+
+        Assert.Equal(1, handler.MaxConcurrency);
+        Assert.Empty(scaleChanges);
     }
 
     [Fact]
@@ -191,17 +154,7 @@ public sealed class KeyedOrderedDispatcherTests
         using var handler = new GatedKeyedHandler();
         var scaleChanges = new ConcurrentQueue<DispatcherScaleChange>();
         await using var dispatcher = new KeyedOrderedDispatcher<string, int>(
-            new DispatcherOptions
-            {
-                Parallelism = 1,
-                MaxParallelism = 2,
-                KeyBatchSize = 1,
-                ScaleInterval = TimeSpan.FromMilliseconds(5),
-                ScaleUpCooldown = TimeSpan.FromMilliseconds(5),
-                ScaleDownIdleDuration = TimeSpan.FromMilliseconds(50),
-                ScaleUpConsecutiveSamples = 1,
-                ScaleObserver = scaleChanges.Enqueue
-            });
+            CreateDynamicOptions(1, 2, scaleChanges.Enqueue));
 
         dispatcher.Start(handler);
 
@@ -251,6 +204,7 @@ public sealed class KeyedOrderedDispatcherTests
             Assert.Equal(1, scaleDown.Stats.WorkerCount);
             Assert.Equal(0, scaleDown.Stats.QueuedWorkItems);
             Assert.True(scaleDown.Stats.PendingMessages > 0);
+            Assert.False(handler.HotCancellationRequested);
         }
         finally
         {
@@ -263,6 +217,29 @@ public sealed class KeyedOrderedDispatcherTests
     }
 
     [Fact]
+    public async Task CompleteWhileBackloggedStillScalesAndDrains()
+    {
+        var handler = new DelayingKeyedHandler(TimeSpan.FromMilliseconds(25));
+        var scaleChanges = new ConcurrentQueue<DispatcherScaleChange>();
+        await using var dispatcher = new KeyedOrderedDispatcher<string, int>(
+            CreateDynamicOptions(1, 3, scaleChanges.Enqueue));
+
+        dispatcher.Start(handler);
+
+        for (var i = 0; i < 60; i++)
+        {
+            dispatcher.Enqueue($"key-{i % 8}", i);
+        }
+
+        await dispatcher.CompleteAsync();
+
+        Assert.Contains(scaleChanges, change => change.IsScaleUp);
+        Assert.Equal(0, dispatcher.GetStats().PendingMessages);
+        Assert.Equal(0, dispatcher.GetStats().WorkerCount);
+        Assert.False(dispatcher.GetStats().IsAccepting);
+    }
+
+    [Fact]
     public async Task EnqueueBeforeStartThrows()
     {
         await using var dispatcher = new KeyedOrderedDispatcher<string, int>();
@@ -270,26 +247,24 @@ public sealed class KeyedOrderedDispatcherTests
         Assert.Throws<InvalidOperationException>(() => dispatcher.Enqueue("a", 1));
     }
 
-    private sealed class BlockingKeyedHandler : IKeyedMessageHandler<string, int>, IDisposable
+    private static DispatcherOptions CreateDynamicOptions(
+        int parallelism,
+        int maxParallelism,
+        Action<DispatcherScaleChange>? scaleObserver = null)
     {
-        private readonly ManualResetEventSlim _firstStarted = new();
-        private readonly ManualResetEventSlim _release = new();
-
-        public bool FirstStarted => _firstStarted.IsSet;
-
-        public void Handle(string key, int message, CancellationToken cancellationToken)
+        return new DispatcherOptions
         {
-            _firstStarted.Set();
-            _release.Wait(cancellationToken);
-        }
-
-        public void Release() => _release.Set();
-
-        public void Dispose()
-        {
-            _firstStarted.Dispose();
-            _release.Dispose();
-        }
+            Parallelism = parallelism,
+            MaxParallelism = maxParallelism,
+            KeyBatchSize = 1,
+            ScaleInterval = TimeSpan.FromMilliseconds(20),
+            ScaleObservationWindow = TimeSpan.FromMilliseconds(100),
+            ScaleUpSaturationThreshold = 0.80,
+            ScaleDownUtilizationThreshold = 0.70,
+            ScaleUpCooldown = TimeSpan.FromMilliseconds(20),
+            ScaleDownCooldown = TimeSpan.FromMilliseconds(40),
+            ScaleObserver = scaleObserver
+        };
     }
 
     private sealed class RecordingKeyedHandler : IKeyedMessageHandler<string, int>
@@ -339,16 +314,21 @@ public sealed class KeyedOrderedDispatcherTests
         private readonly ManualResetEventSlim _coldStarted = new();
         private readonly ManualResetEventSlim _releaseHot = new();
         private readonly ManualResetEventSlim _releaseCold = new();
+        private int _hotCancellationRequested;
 
         public bool HotStarted => _hotStarted.IsSet;
 
         public bool ColdStarted => _coldStarted.IsSet;
+
+        public bool HotCancellationRequested => Volatile.Read(ref _hotCancellationRequested) != 0;
 
         public void Handle(string key, int message, CancellationToken cancellationToken)
         {
             if (key == "hot" && message == 0)
             {
                 _hotStarted.Set();
+                using var registration = cancellationToken.Register(
+                    () => Volatile.Write(ref _hotCancellationRequested, 1));
                 _releaseHot.Wait(cancellationToken);
             }
             else if (key == "cold")

@@ -10,11 +10,12 @@ await using var dispatcher = new KeyedOrderedDispatcher<string, MessageEnvelope>
         Parallelism = 1,
         MaxParallelism = 4,
         KeyBatchSize = 2,
-        ScaleInterval = TimeSpan.FromMilliseconds(10),
-        ScaleUpCooldown = TimeSpan.FromMilliseconds(10),
-        ScaleDownIdleDuration = TimeSpan.FromMilliseconds(100),
-        ScaleUpQueuedWorkItemsThreshold = 0,
-        ScaleUpConsecutiveSamples = 1,
+        ScaleInterval = TimeSpan.FromMilliseconds(20),
+        ScaleObservationWindow = TimeSpan.FromMilliseconds(100),
+        ScaleUpSaturationThreshold = 0.80,
+        ScaleDownUtilizationThreshold = 0.70,
+        ScaleUpCooldown = TimeSpan.FromMilliseconds(20),
+        ScaleDownCooldown = TimeSpan.FromMilliseconds(40),
         ScaleObserver = static change =>
             Console.WriteLine(
                 $"keyed scale {(change.IsScaleUp ? "up" : "down")}: " +
