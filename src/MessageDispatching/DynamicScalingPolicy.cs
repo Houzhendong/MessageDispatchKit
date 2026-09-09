@@ -56,6 +56,8 @@ internal sealed class DynamicScalingPolicy
 
     private int _baselineWorkerCount;
     private double _baselineThroughput;
+    private int _nextProbeStep = 1;
+    private int _activeProbeStep;
     private int _probeTargetWorkerCount;
     private int _warmupSamplesRemaining;
 
@@ -80,6 +82,10 @@ internal sealed class DynamicScalingPolicy
     }
 
     internal ScalingState State => _state;
+
+    internal int NextProbeStep => _nextProbeStep;
+
+    internal int ActiveProbeStep => _activeProbeStep;
 
     public ScalingResult Observe(ScalingSnapshot snapshot)
     {
@@ -168,6 +174,7 @@ internal sealed class DynamicScalingPolicy
             else if (HasElapsed(_idleStartTimestamp, snapshot.Timestamp, _scaleDownIdleDuration))
             {
                 _scaleDownTargetWorkerCount = snapshot.DesiredWorkerCount - 1;
+                _nextProbeStep = 1;
                 _state = ScalingState.ScaleDownConvergence;
                 ResetIdlePeriod();
 
@@ -221,14 +228,21 @@ internal sealed class DynamicScalingPolicy
         _baselineWorkerCount = snapshot.WorkerCount;
         _baselineThroughput = _smoothedThroughput;
 
-        var scaleUpStep = _baselineThroughput > 0
-            ? Math.Max(1, snapshot.WorkerCount / 4)
+        var requestedStep = _baselineThroughput > 0
+            ? _nextProbeStep
             : 1;
-        var requestedTarget = (long)snapshot.WorkerCount + scaleUpStep;
-        var target = Math.Min(requestedTarget, _maximumWorkerCount);
-        target = Math.Min(target, runnableParallelism);
+        var proportionalStepCap = snapshot.WorkerCount <= 2
+            ? snapshot.WorkerCount
+            : (snapshot.WorkerCount / 2) + (snapshot.WorkerCount % 2);
+        var actualStep = Math.Min((long)requestedStep, proportionalStepCap);
+        actualStep = Math.Min(
+            actualStep,
+            (long)_maximumWorkerCount - snapshot.WorkerCount);
+        actualStep = Math.Min(
+            actualStep,
+            runnableParallelism - snapshot.WorkerCount);
 
-        if (target <= snapshot.WorkerCount)
+        if (actualStep <= 0)
         {
             return CreateResult(
                 snapshot.DesiredWorkerCount,
@@ -238,7 +252,8 @@ internal sealed class DynamicScalingPolicy
                 null);
         }
 
-        _probeTargetWorkerCount = (int)target;
+        _activeProbeStep = (int)actualStep;
+        _probeTargetWorkerCount = snapshot.WorkerCount + _activeProbeStep;
         _warmupSamplesRemaining = _probeWarmupSamples;
         _state = ScalingState.ProbeConvergence;
         ResetIdlePeriod();
@@ -381,6 +396,32 @@ internal sealed class DynamicScalingPolicy
         bool isSaturated,
         double? gain)
     {
+        if (_baselineThroughput > 0 && gain.HasValue)
+        {
+            var relativeWorkerIncrease =
+                _activeProbeStep / (double)_baselineWorkerCount;
+            var elasticity = gain.Value / relativeWorkerIncrease;
+
+            if (elasticity >= 0.75)
+            {
+                _nextProbeStep = _activeProbeStep > int.MaxValue / 2
+                    ? int.MaxValue
+                    : _activeProbeStep * 2;
+            }
+            else if (elasticity >= 0.25)
+            {
+                _nextProbeStep = _activeProbeStep;
+            }
+            else
+            {
+                _nextProbeStep = Math.Max(1, _activeProbeStep / 2);
+            }
+        }
+        else
+        {
+            _nextProbeStep = 1;
+        }
+
         _baselineWorkerCount = _probeTargetWorkerCount;
         _baselineThroughput = _smoothedThroughput;
         _state = ScalingState.Stable;
@@ -399,6 +440,11 @@ internal sealed class DynamicScalingPolicy
         bool isSaturated,
         double? gain)
     {
+        _nextProbeStep = gain.HasValue &&
+            double.IsFinite(gain.Value) &&
+            gain.Value >= 0
+                ? Math.Max(1, _activeProbeStep / 2)
+                : 1;
         _state = ScalingState.RollbackConvergence;
         ResetIdlePeriod();
 

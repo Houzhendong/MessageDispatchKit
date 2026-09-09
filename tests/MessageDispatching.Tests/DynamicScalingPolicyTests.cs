@@ -56,7 +56,7 @@ public sealed class DynamicScalingPolicyTests
     }
 
     [Fact]
-    public void PositiveBaselineUsesProportionalScaleUpStep()
+    public void PositiveBaselineStartsWithSingleWorkerScaleUpStep()
     {
         var policy = CreatePolicy(maxParallelism: 32, smoothingFactor: 1);
 
@@ -64,7 +64,9 @@ public sealed class DynamicScalingPolicyTests
         var result = Observe(policy, 1, 800, workers: 8, desired: 8, busy: 8, ready: 20);
 
         Assert.Equal(ScalingReason.ProbeUp, result.Reason);
-        Assert.Equal(10, result.DesiredWorkerCount);
+        Assert.Equal(9, result.DesiredWorkerCount);
+        Assert.Equal(1, policy.ActiveProbeStep);
+        Assert.Equal(1, policy.NextProbeStep);
         Assert.Equal(ScalingState.ProbeConvergence, policy.State);
     }
 
@@ -96,6 +98,363 @@ public sealed class DynamicScalingPolicyTests
 
         Assert.Equal(ScalingReason.ProbeUp, result.Reason);
         Assert.Equal(expectedTarget, result.DesiredWorkerCount);
+    }
+
+    [Fact]
+    public void StrongAcceptedProbesDoubleNextStepFromOneToTwoThenTwoToFour()
+    {
+        var policy = CreatePolicy(
+            maxParallelism: 16,
+            smoothingFactor: 1,
+            warmupSamples: 0);
+
+        AcceptStrongOneToTwoWorkerProbe(policy);
+        var secondStarted = Observe(
+            policy,
+            4,
+            500,
+            workers: 2,
+            desired: 2,
+            busy: 2,
+            ready: 10);
+        Observe(policy, 5, 600, workers: 4, desired: 4, busy: 4, ready: 10);
+        var secondAccepted = Observe(
+            policy,
+            6,
+            800,
+            workers: 4,
+            desired: 4,
+            busy: 4,
+            ready: 10);
+
+        Assert.Equal(ScalingReason.ProbeUp, secondStarted.Reason);
+        Assert.Equal(4, secondStarted.DesiredWorkerCount);
+        Assert.Equal(2, policy.ActiveProbeStep);
+        Assert.Equal(ScalingReason.ProbeAccepted, secondAccepted.Reason);
+        Assert.Equal(4, policy.NextProbeStep);
+    }
+
+    [Fact]
+    public void ProportionalSafetyCapLimitsStepToHalfAboveTwoWorkers()
+    {
+        var policy = CreatePolicy(
+            maxParallelism: 16,
+            smoothingFactor: 1,
+            warmupSamples: 0);
+
+        AcceptStrongTwoToFourWorkerProbe(policy);
+        var result = Observe(
+            policy,
+            7,
+            1000,
+            workers: 4,
+            desired: 4,
+            busy: 4,
+            ready: 20);
+
+        Assert.Equal(ScalingReason.ProbeUp, result.Reason);
+        Assert.Equal(6, result.DesiredWorkerCount);
+        Assert.Equal(2, policy.ActiveProbeStep);
+        Assert.Equal(4, policy.NextProbeStep);
+    }
+
+    [Fact]
+    public void MediumElasticityRetainsActualProbeStep()
+    {
+        var policy = CreatePolicy(
+            maxParallelism: 16,
+            smoothingFactor: 1,
+            warmupSamples: 0);
+
+        AcceptStrongOneToTwoWorkerProbe(policy);
+        Observe(policy, 4, 500, workers: 2, desired: 2, busy: 2, ready: 10);
+        Observe(policy, 5, 600, workers: 4, desired: 4, busy: 4, ready: 10);
+        var result = Observe(
+            policy,
+            6,
+            750,
+            workers: 4,
+            desired: 4,
+            busy: 4,
+            ready: 10);
+
+        Assert.Equal(ScalingReason.ProbeAccepted, result.Reason);
+        Assert.Equal(2, policy.ActiveProbeStep);
+        Assert.Equal(2, policy.NextProbeStep);
+    }
+
+    [Fact]
+    public void WeakAcceptedElasticityHalvesActualProbeStep()
+    {
+        var policy = CreatePolicy(
+            maxParallelism: 16,
+            minimumGain: 0.05,
+            smoothingFactor: 1,
+            warmupSamples: 0);
+
+        AcceptStrongOneToTwoWorkerProbe(policy);
+        Observe(policy, 4, 500, workers: 2, desired: 2, busy: 2, ready: 10);
+        Observe(policy, 5, 600, workers: 4, desired: 4, busy: 4, ready: 10);
+        var result = Observe(
+            policy,
+            6,
+            710,
+            workers: 4,
+            desired: 4,
+            busy: 4,
+            ready: 10);
+
+        Assert.Equal(ScalingReason.ProbeAccepted, result.Reason);
+        Assert.Equal(2, policy.ActiveProbeStep);
+        Assert.Equal(1, policy.NextProbeStep);
+    }
+
+    [Fact]
+    public void PositiveInsufficientGainRejectsAndHalvesActualProbeStep()
+    {
+        var policy = CreatePolicy(
+            maxParallelism: 16,
+            minimumGain: 0.1,
+            smoothingFactor: 1,
+            warmupSamples: 0);
+
+        AcceptStrongOneToTwoWorkerProbe(policy);
+        Observe(policy, 4, 500, workers: 2, desired: 2, busy: 2, ready: 10);
+        Observe(policy, 5, 600, workers: 4, desired: 4, busy: 4, ready: 10);
+        var result = Observe(
+            policy,
+            6,
+            705,
+            workers: 4,
+            desired: 4,
+            busy: 4,
+            ready: 10);
+
+        Assert.Equal(ScalingReason.ProbeRejected, result.Reason);
+        Assert.Equal(2, result.DesiredWorkerCount);
+        Assert.Equal(2, policy.ActiveProbeStep);
+        Assert.Equal(1, policy.NextProbeStep);
+    }
+
+    [Fact]
+    public void NegativeAndNullProbeGainsResetNextStep()
+    {
+        var negativePolicy = CreatePolicy(
+            maxParallelism: 16,
+            minimumGain: 0.1,
+            smoothingFactor: 1,
+            warmupSamples: 0);
+        var nullPolicy = CreatePolicy(
+            maxParallelism: 16,
+            minimumGain: 0.1,
+            smoothingFactor: 1,
+            warmupSamples: 0);
+
+        AcceptStrongOneToTwoWorkerProbe(negativePolicy);
+        Observe(negativePolicy, 4, 500, workers: 2, desired: 2, busy: 2, ready: 10);
+        Observe(negativePolicy, 5, 600, workers: 4, desired: 4, busy: 4, ready: 10);
+        var negative = Observe(
+            negativePolicy,
+            6,
+            680,
+            workers: 4,
+            desired: 4,
+            busy: 4,
+            ready: 10);
+
+        AcceptStrongOneToTwoWorkerProbe(nullPolicy);
+        Observe(nullPolicy, 4, 500, workers: 2, desired: 2, busy: 2, ready: 10);
+        Observe(nullPolicy, 5, 600, workers: 4, desired: 4, busy: 4, ready: 10);
+        var inconclusive = Observe(
+            nullPolicy,
+            6,
+            800,
+            workers: 4,
+            desired: 4,
+            busy: 1,
+            ready: 1);
+
+        Assert.Equal(ScalingReason.ProbeRejected, negative.Reason);
+        Assert.True(negative.ProbeGain < 0);
+        Assert.Equal(1, negativePolicy.NextProbeStep);
+        Assert.Equal(ScalingReason.ProbeRejected, inconclusive.Reason);
+        Assert.Null(inconclusive.ProbeGain);
+        Assert.Equal(1, nullPolicy.NextProbeStep);
+    }
+
+    [Fact]
+    public void ZeroBaselineAlwaysProbesOneWorkerAndAcceptedProbeResetsNextStep()
+    {
+        var policy = CreatePolicy(
+            maxParallelism: 16,
+            smoothingFactor: 1,
+            warmupSamples: 0);
+
+        AcceptStrongOneToTwoWorkerProbe(policy);
+        var firstStarted = Observe(
+            policy,
+            4,
+            400,
+            workers: 2,
+            desired: 2,
+            busy: 2,
+            ready: 10);
+        Observe(policy, 5, 400, workers: 3, desired: 3, busy: 3, ready: 10);
+        var accepted = Observe(
+            policy,
+            6,
+            401,
+            workers: 3,
+            desired: 3,
+            busy: 3,
+            ready: 10);
+        var secondStarted = Observe(
+            policy,
+            7,
+            401,
+            workers: 3,
+            desired: 3,
+            busy: 3,
+            ready: 10);
+
+        Assert.Equal(ScalingReason.ProbeUp, firstStarted.Reason);
+        Assert.Equal(3, firstStarted.DesiredWorkerCount);
+        Assert.Equal(ScalingReason.ProbeAccepted, accepted.Reason);
+        Assert.Null(accepted.ProbeGain);
+        Assert.Equal(1, policy.NextProbeStep);
+        Assert.Equal(ScalingReason.ProbeUp, secondStarted.Reason);
+        Assert.Equal(4, secondStarted.DesiredWorkerCount);
+        Assert.Equal(1, policy.ActiveProbeStep);
+    }
+
+    [Theory]
+    [InlineData(5, 20)]
+    [InlineData(16, 1)]
+    public void MaximumAndRunnableCapsUseActualDeltaForAdaptation(
+        int maxParallelism,
+        long ready)
+    {
+        var policy = CreatePolicy(
+            maxParallelism: maxParallelism,
+            smoothingFactor: 1,
+            warmupSamples: 0);
+
+        AcceptStrongTwoToFourWorkerProbe(policy);
+        var started = Observe(
+            policy,
+            7,
+            1000,
+            workers: 4,
+            desired: 4,
+            busy: 4,
+            ready: ready);
+        Observe(policy, 8, 1200, workers: 5, desired: 5, busy: 5, ready: 20);
+        var accepted = Observe(
+            policy,
+            9,
+            1500,
+            workers: 5,
+            desired: 5,
+            busy: 5,
+            ready: 20);
+
+        Assert.Equal(ScalingReason.ProbeUp, started.Reason);
+        Assert.Equal(5, started.DesiredWorkerCount);
+        Assert.Equal(1, policy.ActiveProbeStep);
+        Assert.Equal(ScalingReason.ProbeAccepted, accepted.Reason);
+        Assert.Equal(2, policy.NextProbeStep);
+    }
+
+    [Fact]
+    public void MultiworkerRejectionRollsBackWholeStepBeforeAdjustedProbeAfterCooldown()
+    {
+        var policy = CreatePolicy(
+            maxParallelism: 16,
+            minimumGain: 0.1,
+            smoothingFactor: 1,
+            warmupSamples: 0,
+            scaleUpCooldown: TimeSpan.FromSeconds(2));
+
+        AcceptStrongOneToTwoWorkerProbe(policy);
+        Observe(policy, 4, 500, workers: 2, desired: 2, busy: 2, ready: 10);
+        Observe(policy, 5, 600, workers: 4, desired: 4, busy: 4, ready: 10);
+        var rejected = Observe(
+            policy,
+            6,
+            705,
+            workers: 4,
+            desired: 4,
+            busy: 4,
+            ready: 10);
+        var rollingBack = Observe(
+            policy,
+            7,
+            810,
+            workers: 4,
+            desired: 2,
+            busy: 4,
+            ready: 10);
+        var converged = Observe(
+            policy,
+            8,
+            915,
+            workers: 2,
+            desired: 2,
+            busy: 2,
+            ready: 10);
+        var beforeCooldown = Observe(
+            policy,
+            9.9,
+            1114,
+            workers: 2,
+            desired: 2,
+            busy: 2,
+            ready: 10);
+        var afterCooldown = Observe(
+            policy,
+            10,
+            1125,
+            workers: 2,
+            desired: 2,
+            busy: 2,
+            ready: 10);
+
+        Assert.Equal(ScalingReason.ProbeRejected, rejected.Reason);
+        Assert.Equal(2, rejected.DesiredWorkerCount);
+        Assert.Equal(1, policy.NextProbeStep);
+        Assert.Equal(ScalingReason.None, rollingBack.Reason);
+        Assert.Equal(2, rollingBack.DesiredWorkerCount);
+        Assert.Equal(ScalingReason.None, converged.Reason);
+        Assert.Equal(ScalingReason.None, beforeCooldown.Reason);
+        Assert.Equal(ScalingReason.ProbeUp, afterCooldown.Reason);
+        Assert.Equal(3, afterCooldown.DesiredWorkerCount);
+        Assert.Equal(1, policy.ActiveProbeStep);
+    }
+
+    [Fact]
+    public void IdleScaleDownResetsNextProbeStep()
+    {
+        var policy = CreatePolicy(
+            parallelism: 1,
+            maxParallelism: 16,
+            smoothingFactor: 1,
+            warmupSamples: 0,
+            scaleDownIdleDuration: TimeSpan.FromSeconds(2));
+
+        AcceptStrongOneToTwoWorkerProbe(policy);
+        Observe(policy, 4, 400, workers: 2, desired: 2, busy: 0, ready: 0);
+        var result = Observe(
+            policy,
+            6,
+            400,
+            workers: 2,
+            desired: 2,
+            busy: 0,
+            ready: 0);
+
+        Assert.Equal(ScalingReason.IdleScaleDown, result.Reason);
+        Assert.Equal(1, result.DesiredWorkerCount);
+        Assert.Equal(1, policy.NextProbeStep);
     }
 
     [Theory]
@@ -430,21 +789,30 @@ public sealed class DynamicScalingPolicyTests
     }
 
     [Fact]
-    public void InvalidSampleDuringActiveProbeFailsSafeToRollback()
+    public void InvalidSampleDuringActiveProbeFailsSafeToRollbackAndResetsNextStep()
     {
         var policy = CreatePolicy(
-            maxParallelism: 8,
+            maxParallelism: 16,
             smoothingFactor: 1,
-            warmupSamples: 1);
+            warmupSamples: 0);
 
-        StartTwoToThreeWorkerProbe(policy);
-        Observe(policy, 2, 200, workers: 3, desired: 3, busy: 3, ready: 2);
-        var result = Observe(policy, 2, 250, workers: 3, desired: 3, busy: 3, ready: 2);
+        AcceptStrongOneToTwoWorkerProbe(policy);
+        Observe(policy, 4, 500, workers: 2, desired: 2, busy: 2, ready: 10);
+        var result = Observe(
+            policy,
+            4,
+            550,
+            workers: 2,
+            desired: 4,
+            busy: 2,
+            ready: 10);
 
         Assert.Equal(ScalingReason.ProbeRejected, result.Reason);
         Assert.Equal(2, result.DesiredWorkerCount);
         Assert.Equal(0, result.Throughput);
         Assert.Null(result.ProbeGain);
+        Assert.Equal(2, policy.ActiveProbeStep);
+        Assert.Equal(1, policy.NextProbeStep);
         Assert.Equal(ScalingState.RollbackConvergence, policy.State);
     }
 
@@ -466,6 +834,62 @@ public sealed class DynamicScalingPolicyTests
         Assert.Equal(ScalingReason.None, beforeDelay.Reason);
         Assert.Equal(ScalingReason.IdleScaleDown, afterDelay.Reason);
         Assert.Equal(2, afterDelay.DesiredWorkerCount);
+    }
+
+    private static void AcceptStrongOneToTwoWorkerProbe(DynamicScalingPolicy policy)
+    {
+        Observe(policy, 0, 0, workers: 1, desired: 1, busy: 1, ready: 10);
+        var started = Observe(
+            policy,
+            1,
+            100,
+            workers: 1,
+            desired: 1,
+            busy: 1,
+            ready: 10);
+        Observe(policy, 2, 200, workers: 2, desired: 2, busy: 2, ready: 10);
+        var accepted = Observe(
+            policy,
+            3,
+            400,
+            workers: 2,
+            desired: 2,
+            busy: 2,
+            ready: 10);
+
+        Assert.Equal(ScalingReason.ProbeUp, started.Reason);
+        Assert.Equal(2, started.DesiredWorkerCount);
+        Assert.Equal(ScalingReason.ProbeAccepted, accepted.Reason);
+        Assert.Equal(2, accepted.DesiredWorkerCount);
+        Assert.Equal(2, policy.NextProbeStep);
+    }
+
+    private static void AcceptStrongTwoToFourWorkerProbe(DynamicScalingPolicy policy)
+    {
+        AcceptStrongOneToTwoWorkerProbe(policy);
+        var started = Observe(
+            policy,
+            4,
+            500,
+            workers: 2,
+            desired: 2,
+            busy: 2,
+            ready: 10);
+        Observe(policy, 5, 600, workers: 4, desired: 4, busy: 4, ready: 10);
+        var accepted = Observe(
+            policy,
+            6,
+            800,
+            workers: 4,
+            desired: 4,
+            busy: 4,
+            ready: 10);
+
+        Assert.Equal(ScalingReason.ProbeUp, started.Reason);
+        Assert.Equal(4, started.DesiredWorkerCount);
+        Assert.Equal(ScalingReason.ProbeAccepted, accepted.Reason);
+        Assert.Equal(4, accepted.DesiredWorkerCount);
+        Assert.Equal(4, policy.NextProbeStep);
     }
 
     private static void StartTwoToThreeWorkerProbe(DynamicScalingPolicy policy)

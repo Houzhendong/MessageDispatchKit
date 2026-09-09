@@ -197,27 +197,35 @@ Smoothed = alpha * Current + (1 - alpha) * Previous
 
 ### Scale-up probe
 
-稳定状态且真实饱和时记录 baseline，然后试探：
+稳定状态且真实饱和时记录 baseline，然后使用持久化的自适应 probe step 试探。`NextProbeStep` 初始为 `1`；baseline throughput 为正时使用该值，为零时无论历史 step 多大都强制请求 `+1`：
 
 ```text
-step = max(1, WorkerCount / 4)
-target = min(WorkerCount + step, MaxParallelism, RunnableParallelism)
+requestedStep = BaselineThroughput > 0 ? NextProbeStep : 1
+safetyCap = WorkerCount <= 2
+    ? WorkerCount
+    : ceil(WorkerCount / 2)
+actualStep = min(
+    requestedStep,
+    MaxParallelism - WorkerCount,
+    RunnableParallelism - WorkerCount,
+    safetyCap)
+target = WorkerCount + actualStep
 ```
 
-如果 baseline throughput 近似为零，为避免异常 workload 过快扩容，单次只试探 `+1`。
-
-worker 实际创建完成后，忽略 `ProbeWarmupSamples` 个完整样本，再比较平滑吞吐量：
+`ActiveProbeStep` 记录 cap 后的实际 target delta。后续收益计算和 step 调整都使用该实际 delta，而不是 cap 前的请求值。worker 实际创建完成后，忽略 `ProbeWarmupSamples` 个完整样本，再比较平滑吞吐量：
 
 ```text
 gain = (ProbeThroughput - BaselineThroughput) / BaselineThroughput
+relativeWorkerIncrease = ActiveProbeStep / BaselineWorkerCount
+elasticity = gain / relativeWorkerIncrease
 ```
 
-- `gain >= MinimumUsefulThroughputGain`：接受整个 probe step。
-- 收益不足或为负：desired workers 回退到 baseline。
-- probe 期间可利用并行度低于 target：无法证明新增 capacity 可被使用，保守回退。
-- baseline 为零：probe throughput 转为正值才接受，否则回退；不计算相对 gain。
+- `gain >= MinimumUsefulThroughputGain`：接受整个实际 probe step。
+- 接受正 baseline probe 后：`elasticity >= 0.75` 将下一 step 设为实际 step 的两倍（饱和到 `int.MaxValue`）；`0.25 <= elasticity < 0.75` 保留实际 step；更弱的已接受收益将实际 step 减半，下限为 `1`。
+- 非负有限收益不足而拒绝时，下一 step 设为实际 step 的一半，下限为 `1`；负收益、无 gain、无效 sample 或 probe 期间可利用并行度低于 target 时重置为 `1`。
+- baseline 为零：probe throughput 转为正值才接受，否则回退；不计算相对 gain，接受后下一 step 也重置为 `1`。
 
-失败 probe 的 cooldown 从实际 worker 数完成回退后开始。这样长时间运行的 handler 不会在 worker 尚未退出时消耗完整 cooldown。
+拒绝会一次回退整个 `ActiveProbeStep`。失败 probe 的 cooldown 从实际 worker 数完成回退后开始。这样长时间运行的 handler 不会在 worker 尚未退出时消耗完整 cooldown，也不会在物理回退完成前开始下一次 probe。
 
 ### DesiredWorkerCount 与 worker 生命周期
 
@@ -250,7 +258,7 @@ ReadyWorkItemCount == 0
 && DesiredWorkerCount > Parallelism
 ```
 
-每次实际退休后重新等待完整 idle duration，始终 `-1` 保守缩容。workload 返回会重置 idle timer。
+每次实际退休后重新等待完整 idle duration，始终 `-1` 保守缩容。触发 idle scale-down 时会把 `NextProbeStep` 重置为 `1`；workload 返回会重置 idle timer。
 
 ## Stats
 
