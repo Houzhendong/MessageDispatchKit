@@ -10,17 +10,21 @@ await using var dispatcher = new KeyedOrderedDispatcher<string, MessageEnvelope>
         Parallelism = 1,
         MaxParallelism = 4,
         KeyBatchSize = 2,
-        ScaleInterval = TimeSpan.FromMilliseconds(20),
-        ScaleObservationWindow = TimeSpan.FromMilliseconds(100),
-        ScaleUpSaturationThreshold = 0.80,
-        ScaleDownUtilizationThreshold = 0.70,
-        ScaleUpCooldown = TimeSpan.FromMilliseconds(20),
-        ScaleDownCooldown = TimeSpan.FromMilliseconds(40),
+        DynamicScaling = new DynamicScalingOptions
+        {
+            SampleInterval = TimeSpan.FromMilliseconds(50),
+            MinimumUsefulThroughputGain = 0,
+            ThroughputSmoothingFactor = 1,
+            ProbeWarmupSamples = 0,
+            ScaleUpCooldown = TimeSpan.FromMilliseconds(100),
+            ScaleDownIdleDuration = TimeSpan.FromMilliseconds(250)
+        },
         ScaleObserver = static change =>
             Console.WriteLine(
                 $"keyed scale {(change.IsScaleUp ? "up" : "down")}: " +
                 $"{change.PreviousWorkerCount} -> {change.CurrentWorkerCount}, " +
-                $"pending={change.Stats.PendingMessages}, queued={change.Stats.QueuedWorkItems}")
+                $"desired={change.Stats.DesiredWorkerCount}, " +
+                $"pending={change.Stats.PendingMessages}, ready={change.Stats.ReadyWorkItemCount}")
     });
 
 dispatcher.Start(handler);
@@ -42,7 +46,9 @@ while (true)
     var stats = dispatcher.GetStats();
     peakWorkers = Math.Max(peakWorkers, stats.WorkerCount);
 
-    if (stats.PendingMessages == 0 && stats.WorkerCount == 1)
+    if (stats.PendingMessages == 0 &&
+        stats.WorkerCount == 1 &&
+        stats.DesiredWorkerCount == 1)
     {
         break;
     }
@@ -54,9 +60,14 @@ while (true)
     }
 }
 
+var finalStats = dispatcher.GetStats();
 Console.WriteLine($"max concurrency observed: {handler.MaxConcurrency}");
 Console.WriteLine($"peak workers observed: {peakWorkers}");
-Console.WriteLine($"workers after scale down: {dispatcher.GetStats().WorkerCount}");
+Console.WriteLine($"workers after scale down: {finalStats.WorkerCount}");
+Console.WriteLine(
+    $"throughput={finalStats.Throughput:F1}, smoothed={finalStats.SmoothedThroughput:F1}, " +
+    $"accepted={finalStats.ProbeAcceptCount}, rejected={finalStats.ProbeRejectCount}, " +
+    $"last gain={finalStats.LastProbeGain:P2}");
 
 await dispatcher.CompleteAsync();
 

@@ -54,6 +54,7 @@ public sealed class MessageDispatcherTests
 
         Assert.Equal(new[] { 2 }, transformer.Errors);
         Assert.Equal(new[] { "parsed-1", "parsed-3" }, subscriber.Messages.OrderBy(static value => value));
+        Assert.Equal(3, dispatcher.GetStats().CompletedMessages);
     }
 
     [Fact]
@@ -102,7 +103,58 @@ public sealed class MessageDispatcherTests
     }
 
     [Fact]
-    public async Task DynamicWorkersScaleToMaxAndBackDown()
+    public async Task StatsExposeQueuedMessagesSeparatelyFromPendingMessages()
+    {
+        using var transformer = new SelectiveGatedTransformer();
+        await using var dispatcher = new MessageDispatcher<int, string>(
+            new DispatcherOptions { Parallelism = 1 });
+
+        dispatcher.Start(transformer);
+
+        try
+        {
+            dispatcher.Enqueue(0);
+            await TestWait.UntilAsync(() => transformer.StartedCount == 1);
+            dispatcher.Enqueue(1);
+            dispatcher.Enqueue(2);
+
+            await TestWait.UntilAsync(() => dispatcher.GetStats().QueuedMessageCount == 2);
+
+            var stats = dispatcher.GetStats();
+            Assert.Equal(3, stats.PendingMessages);
+            Assert.Equal(2, stats.QueuedMessageCount);
+            Assert.Equal(1, stats.BusyWorkers);
+            Assert.True(stats.IsSaturated);
+        }
+        finally
+        {
+            transformer.ReleaseAll();
+            await dispatcher.CompleteAsync();
+        }
+    }
+
+    [Fact]
+    public async Task EnqueueBeforeStartRollsBackPendingWithoutCountingCompletion()
+    {
+        var transformer = new PrefixTransformer();
+        var subscriber = new RecordingSubscriber();
+        await using var dispatcher = new MessageDispatcher<int, string>();
+        using var subscription = dispatcher.Subscribe(subscriber);
+
+        Assert.Throws<InvalidOperationException>(() => dispatcher.Enqueue(1));
+        Assert.Equal(0, dispatcher.GetStats().PendingMessages);
+        Assert.Equal(0, dispatcher.GetStats().CompletedMessages);
+
+        dispatcher.Start(transformer);
+        dispatcher.Enqueue(2);
+        await dispatcher.CompleteAsync();
+
+        Assert.Equal(new[] { "parsed-2" }, subscriber.Messages);
+        Assert.Equal(1, dispatcher.GetStats().CompletedMessages);
+    }
+
+    [Fact]
+    public async Task DynamicWorkersScaleUpAndBackDown()
     {
         var transformer = new DelayingTransformer(TimeSpan.FromMilliseconds(25));
         var subscriber = new RecordingSubscriber();
@@ -118,16 +170,17 @@ public sealed class MessageDispatcherTests
             dispatcher.Enqueue(i);
         }
 
-        await TestWait.UntilAsync(() => dispatcher.GetStats().WorkerCount == 4);
+        await TestWait.UntilAsync(() => dispatcher.GetStats().WorkerCount > 1);
         await TestWait.UntilAsync(() => dispatcher.GetStats().PendingMessages == 0);
         await TestWait.UntilAsync(() => dispatcher.GetStats().WorkerCount == 1);
 
         Assert.True(transformer.MaxConcurrency > 1);
         Assert.Equal(80, subscriber.Messages.Count);
-        Assert.All(
-            scaleChanges,
-            change => Assert.Equal(1, Math.Abs(change.CurrentWorkerCount - change.PreviousWorkerCount)));
+        Assert.Contains(scaleChanges, change => change.IsScaleUp);
+        Assert.Contains(scaleChanges, change => !change.IsScaleUp);
         Assert.DoesNotContain(scaleChanges, change => change.CurrentWorkerCount > 4);
+        Assert.True(dispatcher.GetStats().ScaleUpCount > 0);
+        Assert.True(dispatcher.GetStats().ScaleDownCount > 0);
 
         await dispatcher.CompleteAsync();
     }
@@ -160,26 +213,23 @@ public sealed class MessageDispatcherTests
 
         await TestWait.UntilAsync(() => scaleChanges.Count >= 1);
         await TestWait.UntilAsync(() => dispatcher.GetStats().PendingMessages == 0);
-        await TestWait.UntilAsync(() => scaleChanges.Count == 2);
+        await TestWait.UntilAsync(
+            () => scaleChanges.Any(change => !change.IsScaleUp && change.CurrentWorkerCount == 1));
 
         var changes = scaleChanges.ToArray();
-        var scaleUp = changes[0];
-        Assert.Equal(1, scaleUp.PreviousWorkerCount);
+        var scaleUp = changes.First(
+            change => change.IsScaleUp && change.PreviousWorkerCount == 1);
         Assert.Equal(2, scaleUp.CurrentWorkerCount);
-        Assert.True(scaleUp.IsScaleUp);
         Assert.Equal(2, scaleUp.Stats.WorkerCount);
 
-        var scaleDown = changes[1];
+        var scaleDown = changes.First(
+            change => !change.IsScaleUp && change.CurrentWorkerCount == 1);
         Assert.Equal(2, scaleDown.PreviousWorkerCount);
-        Assert.Equal(1, scaleDown.CurrentWorkerCount);
-        Assert.False(scaleDown.IsScaleUp);
         Assert.Equal(1, scaleDown.Stats.WorkerCount);
-        Assert.Equal(0, scaleDown.Stats.QueuedWorkItems);
+        Assert.Equal(1, scaleDown.Stats.DesiredWorkerCount);
         Assert.Equal(20, subscriber.Messages.Count);
 
         await dispatcher.CompleteAsync();
-
-        Assert.Equal(2, scaleChanges.Count);
     }
 
     [Fact]
@@ -200,8 +250,8 @@ public sealed class MessageDispatcherTests
                 dispatcher.Enqueue(i);
             }
 
-            await TestWait.UntilAsync(() => dispatcher.GetStats().WorkerCount == 3);
-            await TestWait.UntilAsync(() => transformer.StartedCount >= 3);
+            await TestWait.UntilAsync(() => dispatcher.GetStats().WorkerCount == 2);
+            await TestWait.UntilAsync(() => transformer.StartedCount >= 2);
 
             transformer.ReleaseCold();
 
@@ -210,7 +260,7 @@ public sealed class MessageDispatcherTests
                 var stats = dispatcher.GetStats();
                 return stats.WorkerCount == 1 &&
                     stats.BusyWorkers == 1 &&
-                    stats.QueuedWorkItems == 0 &&
+                    stats.QueuedMessageCount == 0 &&
                     stats.PendingMessages == 1;
             });
 
@@ -251,9 +301,12 @@ public sealed class MessageDispatcherTests
 
         Assert.Contains(scaleChanges, change => change.IsScaleUp);
         Assert.Equal(60, subscriber.Messages.Count);
-        Assert.Equal(0, dispatcher.GetStats().PendingMessages);
-        Assert.Equal(0, dispatcher.GetStats().WorkerCount);
-        Assert.False(dispatcher.GetStats().IsAccepting);
+        var stats = dispatcher.GetStats();
+        Assert.Equal(0, stats.PendingMessages);
+        Assert.Equal(60, stats.CompletedMessages);
+        Assert.Equal(0, stats.WorkerCount);
+        Assert.Equal(0, stats.DesiredWorkerCount);
+        Assert.False(stats.Accepting);
     }
 
     [Fact]
@@ -307,12 +360,15 @@ public sealed class MessageDispatcherTests
         {
             Parallelism = parallelism,
             MaxParallelism = maxParallelism,
-            ScaleInterval = TimeSpan.FromMilliseconds(20),
-            ScaleObservationWindow = TimeSpan.FromMilliseconds(100),
-            ScaleUpSaturationThreshold = 0.80,
-            ScaleDownUtilizationThreshold = 0.70,
-            ScaleUpCooldown = TimeSpan.FromMilliseconds(20),
-            ScaleDownCooldown = TimeSpan.FromMilliseconds(40),
+            DynamicScaling = new DynamicScalingOptions
+            {
+                SampleInterval = TimeSpan.FromMilliseconds(20),
+                MinimumUsefulThroughputGain = 0,
+                ThroughputSmoothingFactor = 1,
+                ProbeWarmupSamples = 0,
+                ScaleUpCooldown = TimeSpan.FromMilliseconds(20),
+                ScaleDownIdleDuration = TimeSpan.FromMilliseconds(40)
+            },
             ScaleObserver = scaleObserver
         };
     }

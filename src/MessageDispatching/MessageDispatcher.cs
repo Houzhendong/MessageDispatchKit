@@ -10,9 +10,7 @@ public sealed class MessageDispatcher<TInput, TOutput> : IAsyncDisposable
         public readonly CancellationTokenSource RetirementCts = new();
         public Task WorkerTask { get; set; } = Task.CompletedTask;
         public bool IsWaiting;
-        public bool RetirementCommitted;
-        public int PreviousWorkerCount;
-        public int CurrentWorkerCount;
+        public bool RetirementRequested;
 
         public void Dispose() => RetirementCts.Dispose();
     }
@@ -52,13 +50,21 @@ public sealed class MessageDispatcher<TInput, TOutput> : IAsyncDisposable
     private readonly DynamicScalingPolicy? _scalingPolicy;
     private readonly bool _singleWorkerMode;
     private readonly bool _dynamicScalingEnabled;
-    private WorkerRegistration? _pendingRetirement;
     private Task? _scaleController;
 
-    private int _pendingMessages;
-    private int _queuedWorkItemCount;
+    private long _pendingMessages;
+    private long _completedMessages;
+    private long _queuedMessageCount;
+    private long _scaleUpCount;
+    private long _scaleDownCount;
+    private long _probeAcceptCount;
+    private long _probeRejectCount;
     private int _workerCount;
+    private int _desiredWorkerCount;
     private int _busyWorkers;
+    private double _throughput;
+    private double _smoothedThroughput;
+    private double _lastProbeGain = double.NaN;
     private IMessageTransformer<TInput, TOutput>? _transformer;
     private IMessageSubscriber<TOutput>[] _subscribers = [];
     private bool _started;
@@ -127,6 +133,7 @@ public sealed class MessageDispatcher<TInput, TOutput> : IAsyncDisposable
             Volatile.Write(ref _transformer, transformer);
             _started = true;
             Volatile.Write(ref _accepting, true);
+            Volatile.Write(ref _desiredWorkerCount, _options.Parallelism);
 
             lock (_workersLock)
             {
@@ -145,12 +152,26 @@ public sealed class MessageDispatcher<TInput, TOutput> : IAsyncDisposable
 
     public DispatcherStats GetStats()
     {
+        var workerCount = Volatile.Read(ref _workerCount);
+        var busyWorkers = Volatile.Read(ref _busyWorkers);
+        var queuedMessageCount = Interlocked.Read(ref _queuedMessageCount);
+        var lastProbeGain = Volatile.Read(ref _lastProbeGain);
+
         return new DispatcherStats(
-            Volatile.Read(ref _pendingMessages),
-            0,
-            Volatile.Read(ref _workerCount),
-            Volatile.Read(ref _busyWorkers),
-            Volatile.Read(ref _queuedWorkItemCount),
+            Interlocked.Read(ref _pendingMessages),
+            Interlocked.Read(ref _completedMessages),
+            workerCount,
+            Volatile.Read(ref _desiredWorkerCount),
+            busyWorkers,
+            queuedMessageCount,
+            Volatile.Read(ref _throughput),
+            Volatile.Read(ref _smoothedThroughput),
+            IsSaturated(workerCount, busyWorkers, queuedMessageCount),
+            Interlocked.Read(ref _scaleUpCount),
+            Interlocked.Read(ref _scaleDownCount),
+            Interlocked.Read(ref _probeAcceptCount),
+            Interlocked.Read(ref _probeRejectCount),
+            double.IsNaN(lastProbeGain) ? null : lastProbeGain,
             Volatile.Read(ref _accepting) && !Volatile.Read(ref _disposed));
     }
 
@@ -169,17 +190,17 @@ public sealed class MessageDispatcher<TInput, TOutput> : IAsyncDisposable
 
             cancellationToken.ThrowIfCancellationRequested();
 
-            Interlocked.Increment(ref _queuedWorkItemCount);
+            Interlocked.Increment(ref _queuedMessageCount);
 
             if (!_queue.Writer.TryWrite(input))
             {
-                Interlocked.Decrement(ref _queuedWorkItemCount);
+                Interlocked.Decrement(ref _queuedMessageCount);
                 throw new InvalidOperationException("Failed to enqueue the message.");
             }
         }
         catch
         {
-            MarkMessageCompleted();
+            RollbackPendingMessage();
             throw;
         }
     }
@@ -197,13 +218,12 @@ public sealed class MessageDispatcher<TInput, TOutput> : IAsyncDisposable
 
             _completed = true;
             Volatile.Write(ref _accepting, false);
-            shouldCompleteQueue = Volatile.Read(ref _pendingMessages) == 0;
+            shouldCompleteQueue = Interlocked.Read(ref _pendingMessages) == 0;
         }
 
         if (shouldCompleteQueue)
         {
-            _scaleCts.Cancel();
-            _queue.Writer.TryComplete();
+            FinishGracefulDrain();
         }
     }
 
@@ -226,6 +246,11 @@ public sealed class MessageDispatcher<TInput, TOutput> : IAsyncDisposable
             _completed = true;
             Volatile.Write(ref _disposed, true);
             Volatile.Write(ref _accepting, false);
+
+            lock (_workersLock)
+            {
+                Volatile.Write(ref _desiredWorkerCount, 0);
+            }
         }
 
         _queue.Writer.TryComplete();
@@ -251,12 +276,12 @@ public sealed class MessageDispatcher<TInput, TOutput> : IAsyncDisposable
     {
         try
         {
-            using var timer = new PeriodicTimer(_options.ScaleInterval);
+            using var timer = new PeriodicTimer(_options.DynamicScaling.SampleInterval);
 
             while (await timer.WaitForNextTickAsync(cancellationToken).ConfigureAwait(false))
             {
                 if (Volatile.Read(ref _disposed) ||
-                    (!Volatile.Read(ref _accepting) && Volatile.Read(ref _pendingMessages) == 0))
+                    (!Volatile.Read(ref _accepting) && Interlocked.Read(ref _pendingMessages) == 0))
                 {
                     return;
                 }
@@ -271,11 +296,9 @@ public sealed class MessageDispatcher<TInput, TOutput> : IAsyncDisposable
 
     private void SampleScale()
     {
-        WorkerRegistration? retirement = null;
-        var notifyScaleUp = false;
+        List<WorkerRegistration>? retirements = null;
         var previousWorkerCount = 0;
         var currentWorkerCount = 0;
-        var currentTimestamp = Stopwatch.GetTimestamp();
         var scalingPolicy = _scalingPolicy ??
             throw new InvalidOperationException("Dynamic scaling is not enabled.");
 
@@ -283,85 +306,64 @@ public sealed class MessageDispatcher<TInput, TOutput> : IAsyncDisposable
         {
             PruneCompletedWorkersCore();
 
+            if (IsTerminalDrain())
+            {
+                Volatile.Write(ref _desiredWorkerCount, 0);
+                return;
+            }
+
+            var result = scalingPolicy.Observe(
+                new ScalingSnapshot(
+                    Volatile.Read(ref _workerCount),
+                    Volatile.Read(ref _desiredWorkerCount),
+                    Volatile.Read(ref _busyWorkers),
+                    Interlocked.Read(ref _queuedMessageCount),
+                    Interlocked.Read(ref _completedMessages),
+                    Stopwatch.GetTimestamp()));
+
+            PublishScalingResult(result);
+            Volatile.Write(ref _desiredWorkerCount, result.DesiredWorkerCount);
+
             var workerCount = Volatile.Read(ref _workerCount);
-            var busyWorkers = Volatile.Read(ref _busyWorkers);
-            var queuedWorkItems = Volatile.Read(ref _queuedWorkItemCount);
-            var decision = scalingPolicy.Observe(
-                workerCount,
-                busyWorkers,
-                queuedWorkItems,
-                _pendingRetirement is not null,
-                currentTimestamp);
-
-            if (decision == DynamicScaleDecision.ScaleUp)
+            if (workerCount < result.DesiredWorkerCount)
             {
-                workerCount = Volatile.Read(ref _workerCount);
-                busyWorkers = Volatile.Read(ref _busyWorkers);
-                queuedWorkItems = Volatile.Read(ref _queuedWorkItemCount);
-
-                if (Volatile.Read(ref _disposed) ||
-                    workerCount >= _options.EffectiveMaxParallelism ||
-                    busyWorkers < workerCount ||
-                    queuedWorkItems <= 0 ||
-                    _pendingRetirement is not null)
-                {
-                    return;
-                }
-
-                currentWorkerCount = StartWorkerCore();
-                previousWorkerCount = currentWorkerCount - 1;
-                scalingPolicy.RecordScaleChange(currentTimestamp);
-                notifyScaleUp = true;
-            }
-            else if (decision == DynamicScaleDecision.ScaleDown)
-            {
-                workerCount = Volatile.Read(ref _workerCount);
-                busyWorkers = Volatile.Read(ref _busyWorkers);
-                queuedWorkItems = Volatile.Read(ref _queuedWorkItemCount);
-
-                if (Volatile.Read(ref _disposed) ||
-                    workerCount <= _options.Parallelism ||
-                    busyWorkers >= workerCount ||
-                    queuedWorkItems != 0 ||
-                    _pendingRetirement is not null)
-                {
-                    return;
-                }
-
-                retirement = _workers.FirstOrDefault(
-                    worker => worker.IsWaiting &&
-                        !worker.RetirementCommitted &&
-                        !worker.WorkerTask.IsCompleted);
-                if (retirement is null)
-                {
-                    return;
-                }
-
                 previousWorkerCount = workerCount;
-                currentWorkerCount = Interlocked.Decrement(ref _workerCount);
-                retirement.PreviousWorkerCount = previousWorkerCount;
-                retirement.CurrentWorkerCount = currentWorkerCount;
-                _pendingRetirement = retirement;
-                Volatile.Write(ref retirement.RetirementCommitted, true);
-                scalingPolicy.RecordScaleChange(currentTimestamp);
+                while (Volatile.Read(ref _workerCount) < result.DesiredWorkerCount)
+                {
+                    StartWorkerCore();
+                }
+
+                currentWorkerCount = Volatile.Read(ref _workerCount);
+                Interlocked.Add(ref _scaleUpCount, currentWorkerCount - previousWorkerCount);
+            }
+            else if (workerCount > result.DesiredWorkerCount)
+            {
+                retirements = RequestWaitingRetirementsCore();
             }
         }
 
-        if (retirement is not null)
-        {
-            try
-            {
-                retirement.RetirementCts.Cancel();
-            }
-            catch (ObjectDisposedException)
-            {
-                // The selected worker already observed the committed retirement and was pruned.
-            }
-        }
+        CancelRetirements(retirements);
 
-        if (notifyScaleUp)
+        if (currentWorkerCount > previousWorkerCount && !Volatile.Read(ref _disposed))
         {
             NotifyScaleCompleted(previousWorkerCount, currentWorkerCount);
+        }
+    }
+
+    private void PublishScalingResult(ScalingResult result)
+    {
+        Volatile.Write(ref _throughput, result.Throughput);
+        Volatile.Write(ref _smoothedThroughput, result.SmoothedThroughput);
+
+        if (result.Reason == ScalingReason.ProbeAccepted)
+        {
+            Interlocked.Increment(ref _probeAcceptCount);
+            Volatile.Write(ref _lastProbeGain, result.ProbeGain ?? double.NaN);
+        }
+        else if (result.Reason == ScalingReason.ProbeRejected)
+        {
+            Interlocked.Increment(ref _probeRejectCount);
+            Volatile.Write(ref _lastProbeGain, result.ProbeGain ?? double.NaN);
         }
     }
 
@@ -375,14 +377,24 @@ public sealed class MessageDispatcher<TInput, TOutput> : IAsyncDisposable
 
         try
         {
-            while (!Volatile.Read(ref registration.RetirementCommitted))
+            while (true)
             {
+                if (TryClaimRetirement(registration))
+                {
+                    return;
+                }
+
                 while (_queue.Reader.TryRead(out var input))
                 {
                     ProcessQueuedInput(input, cancellationToken);
+
+                    if (TryClaimRetirement(registration))
+                    {
+                        return;
+                    }
                 }
 
-                if (Volatile.Read(ref registration.RetirementCommitted))
+                if (TryClaimRetirement(registration))
                 {
                     return;
                 }
@@ -408,26 +420,121 @@ public sealed class MessageDispatcher<TInput, TOutput> : IAsyncDisposable
         }
         finally
         {
-            if (Volatile.Read(ref registration.RetirementCommitted))
-            {
-                NotifyScaleCompleted(
-                    registration.PreviousWorkerCount,
-                    registration.CurrentWorkerCount);
+            var retirementRequested = Volatile.Read(ref registration.RetirementRequested);
+            int previousWorkerCount;
+            int currentWorkerCount;
 
-                lock (_workersLock)
-                {
-                    if (ReferenceEquals(_pendingRetirement, registration))
-                    {
-                        _pendingRetirement = null;
-                    }
-                }
-            }
-            else
+            lock (_workersLock)
             {
-                lock (_workersLock)
-                {
-                    Interlocked.Decrement(ref _workerCount);
-                }
+                previousWorkerCount = Volatile.Read(ref _workerCount);
+                currentWorkerCount = Interlocked.Decrement(ref _workerCount);
+            }
+
+            if (retirementRequested && !IsTerminalDrain())
+            {
+                Interlocked.Increment(ref _scaleDownCount);
+                NotifyScaleCompleted(previousWorkerCount, currentWorkerCount);
+            }
+        }
+    }
+
+    private bool TryClaimRetirement(WorkerRegistration registration)
+    {
+        if (Volatile.Read(ref registration.RetirementRequested))
+        {
+            return true;
+        }
+
+        if (IsTerminalDrain())
+        {
+            return false;
+        }
+
+        lock (_workersLock)
+        {
+            if (registration.RetirementRequested)
+            {
+                return true;
+            }
+
+            var requestedRetirements = CountRequestedRetirementsCore();
+            if (Volatile.Read(ref _workerCount) - requestedRetirements <=
+                Volatile.Read(ref _desiredWorkerCount))
+            {
+                return false;
+            }
+
+            Volatile.Write(ref registration.RetirementRequested, true);
+            return true;
+        }
+    }
+
+    private List<WorkerRegistration>? RequestWaitingRetirementsCore()
+    {
+        if (IsTerminalDrain())
+        {
+            return null;
+        }
+
+        var remaining = Volatile.Read(ref _workerCount) -
+            CountRequestedRetirementsCore() -
+            Volatile.Read(ref _desiredWorkerCount);
+        if (remaining <= 0)
+        {
+            return null;
+        }
+
+        List<WorkerRegistration>? retirements = null;
+        foreach (var worker in _workers)
+        {
+            if (remaining == 0)
+            {
+                break;
+            }
+
+            if (!worker.IsWaiting || worker.RetirementRequested || worker.WorkerTask.IsCompleted)
+            {
+                continue;
+            }
+
+            Volatile.Write(ref worker.RetirementRequested, true);
+            (retirements ??= []).Add(worker);
+            remaining--;
+        }
+
+        return retirements;
+    }
+
+    private int CountRequestedRetirementsCore()
+    {
+        var count = 0;
+        foreach (var worker in _workers)
+        {
+            if (worker.RetirementRequested && !worker.WorkerTask.IsCompleted)
+            {
+                count++;
+            }
+        }
+
+        return count;
+    }
+
+    private static void CancelRetirements(List<WorkerRegistration>? retirements)
+    {
+        if (retirements is null)
+        {
+            return;
+        }
+
+        foreach (var retirement in retirements)
+        {
+            try
+            {
+                retirement.RetirementCts.Cancel();
+            }
+            catch (ObjectDisposedException)
+            {
+                // The worker already observed the retirement request and was pruned.
             }
         }
     }
@@ -480,13 +587,13 @@ public sealed class MessageDispatcher<TInput, TOutput> : IAsyncDisposable
         }
         finally
         {
-            MarkMessageCompleted();
+            MarkProcessingAttemptCompleted();
         }
     }
 
     private void ProcessQueuedInput(TInput input, CancellationToken cancellationToken)
     {
-        Interlocked.Decrement(ref _queuedWorkItemCount);
+        Interlocked.Decrement(ref _queuedMessageCount);
         Interlocked.Increment(ref _busyWorkers);
 
         try
@@ -511,13 +618,38 @@ public sealed class MessageDispatcher<TInput, TOutput> : IAsyncDisposable
             var change = new DispatcherScaleChange(
                 previousWorkerCount,
                 currentWorkerCount,
-                GetStats());
+                GetScalingStats());
             _scaleObserver(change);
         }
         catch
         {
             // Scale observation must not affect dispatcher state or processing.
         }
+    }
+
+    private DispatcherScalingStats GetScalingStats()
+    {
+        var workerCount = Volatile.Read(ref _workerCount);
+        var busyWorkers = Volatile.Read(ref _busyWorkers);
+        var queuedMessageCount = Interlocked.Read(ref _queuedMessageCount);
+        var lastProbeGain = Volatile.Read(ref _lastProbeGain);
+
+        return new DispatcherScalingStats(
+            Interlocked.Read(ref _pendingMessages),
+            Interlocked.Read(ref _completedMessages),
+            workerCount,
+            Volatile.Read(ref _desiredWorkerCount),
+            busyWorkers,
+            queuedMessageCount,
+            Volatile.Read(ref _throughput),
+            Volatile.Read(ref _smoothedThroughput),
+            IsSaturated(workerCount, busyWorkers, queuedMessageCount),
+            Interlocked.Read(ref _scaleUpCount),
+            Interlocked.Read(ref _scaleDownCount),
+            Interlocked.Read(ref _probeAcceptCount),
+            Interlocked.Read(ref _probeRejectCount),
+            double.IsNaN(lastProbeGain) ? null : lastProbeGain,
+            Volatile.Read(ref _accepting) && !Volatile.Read(ref _disposed));
     }
 
     private int StartWorkerCore()
@@ -567,17 +699,50 @@ public sealed class MessageDispatcher<TInput, TOutput> : IAsyncDisposable
         }
     }
 
-    private void MarkMessageCompleted()
+    private void MarkProcessingAttemptCompleted()
+    {
+        Interlocked.Increment(ref _completedMessages);
+        DecrementPendingMessage();
+    }
+
+    private void RollbackPendingMessage()
+    {
+        DecrementPendingMessage();
+    }
+
+    private void DecrementPendingMessage()
     {
         var remaining = Interlocked.Decrement(ref _pendingMessages);
 
         if (remaining == 0 &&
+            Volatile.Read(ref _completed) &&
             !Volatile.Read(ref _accepting) &&
             !Volatile.Read(ref _disposed))
         {
-            _scaleCts.Cancel();
-            _queue.Writer.TryComplete();
+            FinishGracefulDrain();
         }
+    }
+
+    private void FinishGracefulDrain()
+    {
+        lock (_workersLock)
+        {
+            Volatile.Write(ref _desiredWorkerCount, 0);
+        }
+
+        _scaleCts.Cancel();
+        _queue.Writer.TryComplete();
+    }
+
+    private bool IsTerminalDrain()
+    {
+        return Volatile.Read(ref _disposed) ||
+            (!Volatile.Read(ref _accepting) && Interlocked.Read(ref _pendingMessages) == 0);
+    }
+
+    private static bool IsSaturated(int workerCount, int busyWorkers, long readyWorkItemCount)
+    {
+        return workerCount > 0 && busyWorkers >= workerCount && readyWorkItemCount > 0;
     }
 
     private void Publish(TOutput output, CancellationToken cancellationToken)

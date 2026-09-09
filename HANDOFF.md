@@ -1,139 +1,78 @@
-# Keyed Ordered Dispatcher 交接文档
+# Message Dispatcher 交接文档
 
 ## 背景
 
-远程服务会实时推送内部协议消息。每个消息包由 `MessageType` 和 `ReadOnlyMemory<byte>` 组成，每个 `MessageType` 对应一个具体 protobuf 类型。
+该仓库提供两个同步处理型消息调度组件：
 
-目标是在 C# 中实现统一消息总线：
+- `KeyedOrderedDispatcher<TKey, TMessage>`：同一个 key 严格顺序执行，不同 key 可并行。
+- `MessageDispatcher<TInput, TOutput>`：无 key 的并行转换与订阅发布，不提供消息间顺序保证。
 
-- 总线接入所有推送消息。
-- 按 `MessageType` 分 worker。
-- worker 负责 protobuf 反序列化。
-- 反序列化后的消息交给业务 handler。
-- 每个 `MessageType` 支持并行处理。
-- 同一个业务 key 内部保持顺序，不同 key 尽可能并行。
+典型 workload 是解压、protobuf / MessagePack 反序列化和少量 CPU 处理。动态并行度使用吞吐量探测式 hill climbing，而不是根据消息积压直接计算 worker 数。
 
-本次落地的是其中的核心调度组件：`KeyedOrderedDispatcher<TKey, TMessage>`。
-
-## 当前代码结构
+## 代码结构
 
 ```text
-src/
-  MessageDispatching/
-    MessageDispatching.csproj
-    KeyedOrderedDispatcher.cs
-    DispatcherOptions.cs
-    DispatcherStats.cs
-    DispatcherScaleChange.cs
-    DynamicScalingPolicy.cs
-    IKeyedMessageHandler.cs
-    IMessageTransformer.cs
-    IMessageSubscriber.cs
-    MessageDispatcher.cs
+src/MessageDispatching/
+  DispatcherOptions.cs
+  DynamicScalingOptions.cs
+  DispatcherStats.cs
+  KeyedDispatcherStats.cs
+  DispatcherScalingStats.cs
+  DispatcherScaleChange.cs
+  DynamicScalingPolicy.cs
+  KeyedOrderedDispatcher.cs
+  MessageDispatcher.cs
 
-samples/
-  DispatcherSample/
-    DispatcherSample.csproj
-    NoKeySample.cs
-    Program.cs
+samples/DispatcherSample/
+  Program.cs
+  NoKeySample.cs
 
-tests/
-  MessageDispatching.Tests/
-    MessageDispatching.Tests.csproj
-    DispatcherOptionsTests.cs
-    DynamicScalingPolicyTests.cs
-    KeyedOrderedDispatcherTests.cs
-    MessageDispatcherTests.cs
-    TestWait.cs
+tests/MessageDispatching.Tests/
+  DispatcherOptionsTests.cs
+  DynamicScalingPolicyTests.cs
+  KeyedOrderedDispatcherTests.cs
+  MessageDispatcherTests.cs
+
+benchmarks/MessageDispatching.ScalingBenchmarks/
+  MessageDispatching.ScalingBenchmarks.csproj
+  Program.cs
 ```
 
-核心文件说明：
+## KeyedOrderedDispatcher
 
-- `KeyedOrderedDispatcher.cs`
-  - 实现按 key 保序、跨 key 并行。
-  - 不绑定 protobuf，不绑定 `MessageType`。
-  - 上游反序列化完成后调用同步方法 `Enqueue(key, message)`。
-  - 每个 key 内部用一个单读者、多写者 unbounded channel 存队列，同一 key 并发 `Enqueue` 是线程安全的。写入在 CAS 自旋锁临界区外（先写队列、后在锁内递增计数，计数只滞后不超前，详见 `Enqueue` 内注释）；单读者语义由 Active 标志保证。
+### 调度模型
 
-- `IKeyedMessageHandler.cs`
-  - 业务 handler 和错误处理合并在同一个接口中，方法均为**同步** `void`。
-  - 由调用方实现，并通过 `dispatcher.Start(handler)` 注入；handler 注入后才启动 worker。
-
-- `DispatcherOptions.cs`
-  - 配置并行度、keyed dispatcher 的单 key 批处理大小、动态扩缩容阈值，以及可选的 `ScaleObserver`。
-  - 不再有积压上限：入队无背压、不限制最大入队数。
-
-- `DispatcherStats.cs`
-  - 暴露当前积压消息数、已知分区数、worker 数、忙碌 worker 数、已排队 work item 数、是否继续接收消息。
-
-- `DispatcherScaleChange.cs`
-  - `KeyedOrderedDispatcher` 和 `MessageDispatcher` 共享的动态扩缩容通知数据。
-  - 包含扩缩容前后的 worker 数、方向判断及通知时的 stats 快照。
-
-- `DynamicScalingPolicy.cs`
-  - 两个 dispatcher 共享的内部滚动窗口扩缩容决策器。
-  - 聚合利用率和饱和占空比，不负责启动、取消或等待 worker。
-
-- `samples/DispatcherSample/Program.cs`
-  - 可运行示例。
-  - 演示多个热点 key 不会因为固定 hash 分区而互相阻塞。
-  - 验证同一个 key 内部序号递增。
-
-## 核心设计
-
-不要使用固定 hash 分区模型：
+不要使用固定 hash 分区：
 
 ```text
-hash(key) % partitionCount -> 固定 partition -> 固定 worker
+hash(key) % partitionCount -> 固定 worker
 ```
 
-这个模型的问题是：多个热点 key 如果碰巧落在同一个 partition，会被同一个 worker 串行处理，无法最大化并行。
-
-当前实现使用动态调度模型：
+固定分区会让碰撞到同一分区的热点 key 被迫串行。当前实现使用：
 
 ```text
-每个 key 一个单读者、多写者 unbounded channel 队列
-全局 unbounded ready key 队列，每个 active key 至多一个 token
-全局 worker pool，可选动态扩容
-同一时刻一个 key 最多只被一个 worker 处理
-不同 key 可以被不同 worker 并行处理
+每个 key 一个 SingleReader=true / SingleWriter=false channel
+每个 active key 至多一个全局 ready token
+全局 worker pool
+同一时刻一个 key 至多一个 consumer
 ```
 
-每个 `KeyState` 的并发细节：
+`KeyState.Active` 保证同 key 不会并发消费。`UnreservedMessages` 在 CAS gate 内维护，worker 每次预留最多 `KeyBatchSize` 条消息，再在 gate 外调用 handler。batch 完成后，有剩余消息的 key 会重新进入 ready-key channel。
 
-- 队列是 `SingleReader=true, SingleWriter=false` 的 unbounded channel，同一 key 可以由多个生产者并发 `Enqueue`。
-- 用 CAS（`Interlocked.CompareExchange`）实现自旋锁，`Acquire()` 返回 `IDisposable`，配合 `using` 进出临界区。
-- `Active` 标志保证同一 key 至多一个消费者；并发生产者之间没有额外定义调用顺序，channel 实际接受后的消息由该单消费者顺序处理。
-- handler 调用和消费者 `TryRead` 排空都在锁外，不阻塞其他 key。
-- ready-key channel 是 unbounded；`Active` 保证每个 key 至多存在一条调度链，因此 `ScheduleKey` 使用同步 `TryWrite`，只会在 writer 已完成后失败并回滚计数。
-- 调度判定不依赖 channel 自带的 `Reader.Count`（`SingleConsumerUnboundedChannel` 不支持），而是用 `KeyState.UnreservedMessages` 计数；worker 会先在临界区内预留最多 `KeyBatchSize` 条消息，再到锁外读取处理。
-  - key 状态不再移除；`_states` 使用 copy-on-write `FrozenDictionary` 快照 cache，已知 key 的热路径只做无锁 `TryGetValue`，首次出现新 key 时才加锁重建并发布新快照。
+`_states` 是 copy-on-write `FrozenDictionary`：已知 key 热路径无锁读取，首次出现新 key 时才加锁重建并发布快照。当前不会移除 key 状态。
 
-- `MessageDispatcher.cs`
-  - 实现无 key 的普通消息 dispatcher。
-  - 输入类型和输出类型可以不同：`Enqueue(TInput)` 后，worker 并行执行 `IMessageTransformer<TInput, TOutput>`，再发布 `TOutput`。
-  - 不提供 key 内顺序语义；所有输入消息进入一个全局 unbounded channel。
-  - 如果 `EffectiveMaxParallelism == 1`，输入队列使用 `SingleReader=true, SingleWriter=false` 的 MPSC 模式；否则使用多读多写模式。
-  - 固定单 worker 模式会直接短路动态扩缩容路径：不启动 scale controller，worker 使用专用单 consumer 循环，不进入 retire/scale 判断。
-  - 支持多个 `IMessageSubscriber<TOutput>` 订阅转换后的输出消息。
-  - 同样支持 `Start(transformer)` 延迟启动、同步 `Enqueue(input)`、`CompleteAsync()` 排空、动态扩缩容。
-  - 适用于不需要按业务 key 保序、只需要并行转换消息（例如 protobuf 反序列化）并发布给下游订阅者的场景。
+### 顺序语义
 
-效果：
+保证：
 
-- 同 key：严格 FIFO。
-- 不同 key：动态分配给 worker，尽量并行。
-- 热点 key：不会阻塞其他 key 的调度。
-- 多个热点 key：可以被多个 worker 同时处理。
-- 如果设置 `MaxParallelism > Parallelism`，负载上升时 worker 数可以从初始值扩到上限。
+```text
+同一 key 的 channel 接受顺序 == handler 开始处理顺序
+同一 key 永远不会同时由两个 worker 执行
+```
 
-需要注意：如果单个 key 自身极热，并且业务要求该 key 严格顺序，那么这个 key 本身无法真正并行。这是顺序语义的硬约束。
+不保证不同 key 的全局顺序，也不保证 handler 自己启动的 fire-and-forget 副作用顺序。需要顺序语义的操作必须在同步 handler 返回前完成。
 
-## 使用方式
-
-### keyed dispatcher 基础用法
-
-先实现 handler 接口（同步 `void` 方法）：
+### 基础用法
 
 ```csharp
 public sealed class UserEventHandler : IKeyedMessageHandler<long, UserEvent>
@@ -144,55 +83,25 @@ public sealed class UserEventHandler : IKeyedMessageHandler<long, UserEvent>
     public void HandleError(long userId, UserEvent message, Exception ex, CancellationToken ct)
         => deadLetterQueue.Write(userId, message, ex, ct);
 }
-```
 
-再构造 dispatcher：
-
-```csharp
 await using var dispatcher = new KeyedOrderedDispatcher<long, UserEvent>(
     new DispatcherOptions
     {
-        Parallelism = 16,
+        Parallelism = 4,
+        MaxParallelism = 16,
         KeyBatchSize = 32
     });
 
 dispatcher.Start(new UserEventHandler());
-
 dispatcher.Enqueue(userId, userEvent, ct);
 await dispatcher.CompleteAsync(ct);
 ```
 
-与 protobuf worker 集成时，推荐流程：
+## MessageDispatcher
+
+所有输入进入一个全局 unbounded channel。worker 同步调用 `IMessageTransformer<TInput,TOutput>.Transform`，然后依次同步发布给当前订阅者快照。
 
 ```csharp
-var message = UserEvent.Parser.ParseFrom(payload.Span);
-var key = message.UserId;
-
-dispatcher.Enqueue(key, message, ct);
-```
-
-如果 key 在协议头中已经存在，优先从协议头取 key，避免为了路由提前解析完整 protobuf。
-
-### no-key dispatcher 基础用法
-
-如果消息不需要按业务 key 保序，并且需要并行执行转换后发布给订阅者，可以使用 `MessageDispatcher<TInput, TOutput>`：
-
-```csharp
-public sealed class BroadcastEventParser : IMessageTransformer<ReadOnlyMemory<byte>, BroadcastEvent>
-{
-    public BroadcastEvent Transform(ReadOnlyMemory<byte> payload, CancellationToken ct)
-        => BroadcastEvent.Parser.ParseFrom(payload.Span);
-
-    public void HandleError(ReadOnlyMemory<byte> payload, Exception ex, CancellationToken ct)
-        => logger.LogError(ex, "Parse broadcast failed.");
-}
-
-public sealed class BroadcastEventSubscriber : IMessageSubscriber<BroadcastEvent>
-{
-    public void Handle(BroadcastEvent message, CancellationToken ct)
-        => broadcastService.Handle(message, ct);
-}
-
 await using var dispatcher = new MessageDispatcher<ReadOnlyMemory<byte>, BroadcastEvent>(
     new DispatcherOptions
     {
@@ -206,177 +115,187 @@ dispatcher.Enqueue(payload, ct);
 await dispatcher.CompleteAsync(ct);
 ```
 
-no-key dispatcher 使用全局输入队列，不保证消息之间的业务顺序；吞吐上限由当前 worker 数、转换耗时和下游订阅者处理耗时决定。转换失败不会发布输出；订阅者抛异常不会阻止继续投递给其他订阅者。
+当 `EffectiveMaxParallelism == 1` 时，使用专用 MPSC 单 consumer 路径，不启动 scaling controller。
 
-## 推荐接入形态
+普通 dispatcher 的吞吐量包含 transformer 和同步 subscriber fan-out 的总耗时，因为它们共同占用 worker。
 
-每个 `MessageType` 可以拥有自己的 protobuf worker 和 dispatcher：
+## 动态扩缩容
 
-```text
-MessageBus
-  -> MessageType.UserEvent
-      -> Worker<UserEvent>
-          -> ParseFrom(...)
-          -> KeyedOrderedDispatcher<long, UserEvent>
+### 启用方式
 
-  -> MessageType.OrderEvent
-      -> Worker<OrderEvent>
-          -> ParseFrom(...)
-          -> KeyedOrderedDispatcher<long, OrderEvent>
-```
+`MaxParallelism == 0` 表示固定并行度。只有 `MaxParallelism > Parallelism` 时启用动态扩缩容。
 
-这样可以做到：
-
-- 不同 `MessageType` 之间隔离。
-- 每个 `MessageType` 独立配置并行度并监控积压；需要限流或背压时在 dispatcher 外实现。
-- 每个 `MessageType` 独立定义 key 选择逻辑。
-- 每个 `MessageType` 独立处理错误、重试和死信。
-
-## 关键配置
-
-### Parallelism
-
-初始 worker 数量。
+- `Parallelism`：启动 worker 数，同时也是缩容下限。
+- `MaxParallelism`：动态扩容上限。
+- `DynamicScaling`：采样、收益阈值、warmup、cooldown 和 idle 缩容配置。
 
 ```csharp
-Parallelism = 16
-```
-
-在未启用动态扩容时，它限制同一个 dispatcher 内最多同时处理多少个 key。
-
-如果某个 `MessageType` handler 是 IO 密集型，可以适当调高。如果是 CPU 密集型，通常接近 CPU 核数或略高即可。
-
-### MaxParallelism
-
-动态扩容上限。默认值 `0` 表示不启用动态扩容，固定使用 `Parallelism`。
-
-```csharp
-Parallelism = 1,
-MaxParallelism = 4
-```
-
-当前实现使用同一个周期 controller 同时判断扩容和缩容，不再由各 worker 依赖一次连续空闲超时自行退出。每次采样计算：
-
-```text
-利用率 U = clamp(BusyWorkers / WorkerCount, 0..1)
-饱和样本 S = BusyWorkers >= WorkerCount && QueuedWorkItems > 0 ? 1 : 0
-```
-
-controller 在 `ScaleObservationWindow` 滚动窗口中维护平均利用率和饱和占空比：
-
-- 窗口按实际持续时间加权的饱和占空比达到 `ScaleUpSaturationThreshold`，且最新样本仍饱和时，增加一个 worker。
-- 窗口按实际持续时间加权的平均利用率低于或等于 `ScaleDownUtilizationThreshold`，且最新样本仍有空闲容量并且没有排队 work item 时，退休一个正在等待的 worker。
-- worker 数始终限制在 `Parallelism` floor 和 `MaxParallelism` ceiling 之间。
-- 两个方向每次都只调整一个 worker，并分别受 `ScaleUpCooldown` / `ScaleDownCooldown` 限制；cooldown 从最近一次任意方向的实际变化开始计算，避免刚扩即缩或刚缩即扩。
-
-keyed dispatcher 的 `QueuedWorkItems` 是 ready key 数，no-key dispatcher 中则是全局队列里未被领取的消息数。算法只使用“是否还有可立即并行的排队工作”，不会用 pending 或 queue 绝对值推导目标 worker 数，避免单个不可并行 hot key 的积压造成误判。
-
-keyed dispatcher 在 batch 结束时先减少 `BusyWorkers`、再重新调度仍有积压的 key，因此单 hot key 的 batch 边界不会同时形成 `BusyWorkers == WorkerCount` 和 `QueuedWorkItems > 0` 的虚假饱和样本。同 key 顺序仍由 `KeyState.Active` 保证。
-
-缩容只取消被 controller 选中的空闲 worker 的 channel 等待，不会把 retirement token 传给 handler、transformer 或 subscriber，也不会中断正在处理的用户代码。即使持续存在低速消息，只要窗口按实际持续时间加权的平均利用率足够低，额外 worker 仍可逐步退出，不再要求整个 dispatcher 出现完全静默窗口。
-
-`Complete()` 后如果仍有已入队消息待排空，controller 仍允许扩缩容；当 pending 归零或 `DisposeAsync()` 取消时 controller 退出。
-
-### ScaleObserver（扩缩容观察回调）
-
-两个 dispatcher 都可以在构造时通过 `DispatcherOptions.ScaleObserver` 配置一个回调，用于接入调用方自己的日志或指标系统：
-
-```csharp
-await using var dispatcher = new KeyedOrderedDispatcher<long, UserEvent>(
-    new DispatcherOptions
+new DispatcherOptions
+{
+    Parallelism = 4,
+    MaxParallelism = 32,
+    DynamicScaling = new DynamicScalingOptions
     {
-        Parallelism = 4,
-        MaxParallelism = 16,
-        ScaleObserver = change =>
-            logger.LogInformation(
-                "Dispatcher scaled {Direction} {Previous} -> {Current}, pending={Pending}, queued={Queued}",
-                change.IsScaleUp ? "up" : "down",
-                change.PreviousWorkerCount,
-                change.CurrentWorkerCount,
-                change.Stats.PendingMessages,
-                change.Stats.QueuedWorkItems)
-    });
+        SampleInterval = TimeSpan.FromMilliseconds(500),
+        MinimumUsefulThroughputGain = 0.02,
+        ThroughputSmoothingFactor = 0.25,
+        ProbeWarmupSamples = 1,
+        ScaleUpCooldown = TimeSpan.FromSeconds(2),
+        ScaleDownIdleDuration = TimeSpan.FromSeconds(5)
+    }
+}
 ```
 
-每个 `DispatcherOptions` 只有一个 observer；dispatcher 构造时会保存该回调，运行期间不提供注册、注销或替换入口。`DispatcherScaleChange.IsScaleUp` 用于区分扩容和缩容。
+### 核心信号
 
-observer 只报告动态扩缩容实际提交的单步 worker 数变化。`Start()` 创建初始 worker，以及 `CompleteAsync()` / `DisposeAsync()` 导致的 worker 退出，都保持静默。`DispatcherScaleChange.Stats` 是通知时刻的 best-effort 快照，但 `Stats.WorkerCount` 始终等于 `CurrentWorkerCount`。
+```text
+Saturation
+  -> 证明额外 worker 当前有独立工作可做
 
-observer 同步运行在内部 scale controller 或 retiring worker 任务上，不切换到调用方的 `SynchronizationContext`。回调应保持快速、线程安全，不要在回调内同步等待同一个 dispatcher 关闭。observer 被当作单个不透明回调调用；它抛出的任何异常都会被 dispatcher 吞掉，不影响扩缩容状态、worker/controller 任务、后续消息处理、`CompleteAsync()` 或 `DisposeAsync()`。
+Throughput
+  -> 证明新增 worker 是否值得保留
+```
 
-### ScaleInterval 与 ScaleObservationWindow
+饱和条件：
+
+```text
+WorkerCount > 0
+&& BusyWorkers >= WorkerCount
+&& ReadyWorkItemCount > 0
+```
+
+- keyed：`ReadyWorkItemCount` 是 `ReadyKeyCount`。
+- no-key：`ReadyWorkItemCount` 是 `QueuedMessageCount`。
+
+可利用并行度近似：
+
+```text
+BusyWorkers + ReadyWorkItemCount
+```
+
+keyed dispatcher 不使用 `PendingMessages` 推断 worker 上限。一个 key 即使积压一百万条消息，有效并行度仍然只有一。
+
+### Throughput 与 EWMA
+
+每个 controller sample 使用累计完成数的 delta：
+
+```text
+Throughput = Delta CompletedMessages / Delta TimeSeconds
+```
+
+不能使用 `CompletedMessages / dispatcher lifetime`。实现使用实际 `Stopwatch` 时间，不在每条消息上记录 timestamp。
+
+EWMA：
+
+```text
+Smoothed = alpha * Current + (1 - alpha) * Previous
+```
+
+第一个有效样本直接初始化 EWMA，不与人为的零值混合。
+
+`CompletedMessages` 表示处理尝试已经结束：handler/transformer 成功或抛异常都计数；入队失败回滚 pending 时不计数。
+
+### Scale-up probe
+
+稳定状态且真实饱和时记录 baseline，然后试探：
+
+```text
+step = max(1, WorkerCount / 4)
+target = min(WorkerCount + step, MaxParallelism, RunnableParallelism)
+```
+
+如果 baseline throughput 近似为零，为避免异常 workload 过快扩容，单次只试探 `+1`。
+
+worker 实际创建完成后，忽略 `ProbeWarmupSamples` 个完整样本，再比较平滑吞吐量：
+
+```text
+gain = (ProbeThroughput - BaselineThroughput) / BaselineThroughput
+```
+
+- `gain >= MinimumUsefulThroughputGain`：接受整个 probe step。
+- 收益不足或为负：desired workers 回退到 baseline。
+- probe 期间可利用并行度低于 target：无法证明新增 capacity 可被使用，保守回退。
+- baseline 为零：probe throughput 转为正值才接受，否则回退；不计算相对 gain。
+
+失败 probe 的 cooldown 从实际 worker 数完成回退后开始。这样长时间运行的 handler 不会在 worker 尚未退出时消耗完整 cooldown。
+
+### DesiredWorkerCount 与 worker 生命周期
+
+Policy 只输出 `DesiredWorkerCount`，不保存 `Task`、worker 或 `CancellationTokenSource`。
+
+```text
+Actual < Desired -> dispatcher 创建 worker
+Actual > Desired -> worker 在安全边界自然退出
+```
+
+retirement token 只用于唤醒阻塞在 channel wait 的空闲 worker，不会传入 handler、transformer 或 subscriber。
+
+安全退休边界：
+
+- keyed：处理并重新调度完整 key batch 之后，或获取下一个 ready key 之前。
+- no-key：完整处理一条消息之后，或等待下一条消息之前。
+
+正在执行的用户代码不会因为 rollback/缩容被 cancel。若用户代码永久阻塞，实际回退也会被相应延迟。
+
+### Idle scale-down
+
+缩容不根据 throughput 下降，因为 throughput 下降可能只是输入减少。
+
+只有以下状态持续达到 `ScaleDownIdleDuration` 才将 desired workers 减一：
+
+```text
+ReadyWorkItemCount == 0
+&& BusyWorkers < DesiredWorkerCount
+&& WorkerCount == DesiredWorkerCount
+&& DesiredWorkerCount > Parallelism
+```
+
+每次实际退休后重新等待完整 idle duration，始终 `-1` 保守缩容。workload 返回会重置 idle timer。
+
+## Stats
+
+### KeyedDispatcherStats
+
+`KeyedOrderedDispatcher.GetStats()` 返回：
+
+- `PendingMessages` / `CompletedMessages`
+- `KeyCount` / `ReadyKeyCount`
+- `WorkerCount` / `DesiredWorkerCount` / `BusyWorkers`
+- `Throughput` / `SmoothedThroughput` / `IsSaturated`
+- `ScaleUpCount` / `ScaleDownCount`
+- `ProbeAcceptCount` / `ProbeRejectCount` / `LastProbeGain`
+- `Accepting`
+
+### DispatcherStats
+
+`MessageDispatcher.GetStats()` 使用 `QueuedMessageCount` 替代 keyed 专属字段，其余 scaling 字段一致。
+
+stats 是线程安全计数器的 best-effort 快照，不保证所有字段来自同一个原子瞬间。
+
+## ScaleObserver
+
+`ScaleObserver` 只报告实际 worker count 变化：
+
+- 动态 worker 已创建：报告 scale up。
+- probe accepted：不额外报告。
+- probe rejected：desired 先回退，实际 worker 在安全边界退出后才报告 scale down。
+- 初始 worker 和关闭时的 worker 退出保持静默。
 
 ```csharp
-ScaleInterval = TimeSpan.FromMilliseconds(200),
-ScaleObservationWindow = TimeSpan.FromSeconds(2)
+ScaleObserver = change =>
+    logger.LogInformation(
+        "Dispatcher scaled {Previous} -> {Current}, desired={Desired}, ready={Ready}",
+        change.PreviousWorkerCount,
+        change.CurrentWorkerCount,
+        change.Stats.DesiredWorkerCount,
+        change.Stats.ReadyWorkItemCount)
 ```
 
-controller 每隔 `ScaleInterval` 采样一次，扩容和缩容都根据最近 `ScaleObservationWindow` 的滚动统计做决定；window 至少要包含两个采样间隔。每段状态按实际持续时间加权并按 timestamp 裁剪，timer 延迟不会让过期样本继续影响决策；如果两次采样间隔超过整个 window，则丢弃旧历史重新积累。判断不在 `Enqueue` 或 ready-key 调度热路径上执行。
+`DispatcherScaleChange.Stats` 是公共 `DispatcherScalingStats`，其中 `ReadyWorkItemCount` 对两个 dispatcher 使用各自正确的 ready 单位。observer 异常会被吞掉，不影响处理和 worker 生命周期。
 
-### ScaleUpSaturationThreshold
+## 入队、背压与生命周期
 
-```csharp
-ScaleUpSaturationThreshold = 0.80
-```
-
-表示观测窗口中“所有 worker 都忙，并且仍有 work item 排队”的最小占空比。默认 `0.80` 要求大部分窗口都处于真实饱和状态，瞬时或低占空比的周期 burst 不会逐步积累扩容机会。阈值必须位于 `(0, 1]`。
-
-### ScaleDownUtilizationThreshold
-
-```csharp
-ScaleDownUtilizationThreshold = 0.70
-```
-
-表示触发缩容的最大窗口平均 worker 利用率。最新样本还必须同时满足存在空闲 worker 且 `QueuedWorkItems == 0`。默认值会在缩容后保留一定余量，但不要求 pending 清零或整个 channel 连续静默。阈值必须位于 `[0, 1)`，并严格小于扩容阈值以形成迟滞区间。
-
-### ScaleUpCooldown 与 ScaleDownCooldown
-
-```csharp
-ScaleUpCooldown = TimeSpan.FromSeconds(1),
-ScaleDownCooldown = TimeSpan.FromSeconds(2)
-```
-
-两个方向每次都只调整一个 worker。对应 cooldown 限制下一次同方向决策的速度，但都从最近一次任意方向的实际 worker 数变化开始计算，因此也能抑制反向抖动。
-
-### 旧配置迁移
-
-以下旧属性已删除：
-
-- `ScaleDownIdleDuration`：由滚动利用率缩容和 `ScaleDownCooldown` 取代。
-- `ScaleUpQueuedWorkItemsThreshold`：由窗口饱和占空比取代；queued 仅作为“是否存在可并行排队工作”的布尔信号。
-- `ScaleUpConsecutiveSamples`：由 `ScaleObservationWindow` 和 `ScaleUpSaturationThreshold` 取代。
-
-### 入队与背压
-
-当前实现**不限制最大入队数，也没有背压**。`Enqueue` 是同步方法，不会因积压等待空位。
-
-`Enqueue` 热路径不再持有生命周期锁。全局 `_pendingMessages` 使用 `Interlocked` 做乐观计数，`_accepting` / `_disposed` 使用 `Volatile` 读写；与 `Complete()` / `DisposeAsync()` 并发时允许状态短暂变脏，失败路径会回滚全局 pending 计数。
-
-代价：高峰期积压完全靠内存兜底。上游如果推送速度可能长时间超过处理速度，需要在 dispatcher 之外自行做限流或背压（例如上游 channel、令牌桶、或按 `GetStats().PendingMessages` 主动降速）。
-
-### KeyBatchSize
-
-单个 key 每次被 worker 取到后最多连续处理多少条。
-
-```csharp
-KeyBatchSize = 32
-```
-
-作用：
-
-- 减少频繁调度开销。
-- 防止超热 key 长时间霸占 worker。
-- 在吞吐和公平性之间做平衡。
-
-如果普通 key 延迟敏感，可以调小。如果热点 key 很多且吞吐优先，可以调大。
-
-### key 状态 cache
-
-当前实现不考虑移除 key 的场景。`_states` 是一个读多写少 cache：所有 key 至少进入一次之后，字典结构基本稳定，后续入队通过已发布的 `FrozenDictionary` 快照无锁命中对应 `KeyState`。
-
-首次遇到新 key 时会在写锁内基于当前快照重建字典、加入新 `KeyState`，转换为 `FrozenDictionary` 后再用 `Volatile.Write` 发布。已有快照发布后不再原地修改。
-
-## 生命周期
+两个 dispatcher 都使用 unbounded channel，`Enqueue` 同步且无背压。高峰积压由内存承接；需要限流时应在 dispatcher 外实现。
 
 正常关闭：
 
@@ -385,11 +304,7 @@ dispatcher.Complete();
 await dispatcher.CompleteAsync(ct);
 ```
 
-语义：
-
-- `Complete()` 停止接收新消息。
-- 已经入队的消息会继续处理。
-- 全部处理完成后 worker 退出。
+`Complete()` 停止接收新消息，但 accepted backlog 排空前 controller 仍可扩容。pending 归零后 desired 设为零、停止 controller、完成 channel，worker 正常退出。
 
 强制释放：
 
@@ -397,135 +312,37 @@ await dispatcher.CompleteAsync(ct);
 await dispatcher.DisposeAsync();
 ```
 
-语义：
-
-- 停止接收新消息。
-- 取消 worker。
-- 用于服务停止、异常退出或容器释放。
-
-生产环境中建议在应用停止钩子里优先调用 `CompleteAsync`，给已有消息排空机会。
+会停止接收并取消 worker，适用于服务停止或异常退出。
 
 ## 错误处理
 
-handler 抛异常时，dispatcher 会捕获异常，并调用同一个 `IKeyedMessageHandler` 上的 `HandleError`（同步 `void`，默认空实现）。
+handler/transformer 异常会调用各自的 `HandleError`。subscriber 异常调用 subscriber 的 `HandleError`，且不会阻止继续投递给其他 subscriber。错误处理自身的非取消异常会被 dispatcher 吞掉。
 
-```csharp
-public sealed class UserEventHandler : IKeyedMessageHandler<long, UserEvent>
-{
-    public void Handle(long key, UserEvent message, CancellationToken ct)
-    {
-        userService.Handle(message, ct);
-    }
+当前不自动重试。业务层应自行决定重试、死信和幂等策略。
 
-    public void HandleError(long key, UserEvent message, Exception ex, CancellationToken ct)
-    {
-        logger.LogError(ex, "Handle message failed. Key={Key}", key);
-        deadLetterQueue.Write(key, message, ex, ct);
-    }
-}
-```
+## Benchmark
 
-`HandleError` 自身再抛异常（非取消）会被 dispatcher 吞掉，不影响后续处理；日志/重试失败要在 handler 内部消化。
+`benchmarks/MessageDispatching.ScalingBenchmarks` 是无第三方依赖的 Release 控制台观测工具，覆盖：
 
-当前实现不会自动重试。建议根据业务场景选择：
+- CPU-bound homogeneous
+- 1KB / 10KB / 100KB / 1MB heterogeneous
+- 1000 keys
+- single hot key
+- 4 hot keys / max 32 workers
+- low-to-high burst
+- ordinary dispatcher homogeneous
 
-- 可重试错误：外层接 Polly 或自定义重试。
-- 不可重试错误：写入死信队列。
-- 顺序强依赖场景：谨慎重试，避免后续消息越过失败消息造成业务状态不一致。
+处理逻辑使用实际 buffer CPU work，不用 `Thread.Sleep` 模拟吞吐。输出 CSV-friendly time series，包括 actual/desired/busy workers、pending/completed、ready count、raw/smoothed throughput、saturation、probe counters 和 gain。
 
-## 顺序语义说明
+最优 worker 数依赖 CPU 拓扑、运行时、功耗状态和宿主负载，因此 benchmark 只断言顺序和上限等正确性，不硬编码吞吐峰值对应的 worker 数。
 
-该 dispatcher 保证：
-
-```text
-同一个 key 入队顺序 == handler 开始处理顺序
-```
-
-并且同一个 key 不会同时被两个 worker 处理。
-
-但它不保证：
-
-- 不同 key 之间的全局顺序。
-- handler 内部异步副作用的外部可见顺序。
-- handler 自己启动后台任务后的顺序。
-
-因此 handler 内部不要 fire-and-forget。需要顺序语义的操作必须在 handler 返回前完成。
-
-## 热点 key 的处理建议
-
-如果是多个热点 key 集中在同一个固定 hash 分区，当前动态调度模型已经解决。
-
-如果是单个 key 自己极热，并且该 key 必须严格顺序，则无法通过 dispatcher 并行化这个 key。可选优化方向：
-
-- 重新定义更细粒度 key，例如从 `UserId` 改成 `(UserId, OrderId)`。
-- 拆分处理阶段，例如 parse、validate、enrich 并行，最终状态提交按 key 串行。
-- 对同 key 消息做批处理或合并。
-- 将操作设计成幂等、可交换或基于版本号覆盖。
-- 给超热 key 单独资源池，避免影响普通 key。
-
-## 运行验证
-
-构建库项目：
+## 验证
 
 ```powershell
 dotnet build .\src\MessageDispatching\MessageDispatching.csproj
-```
-
-运行示例：
-
-```powershell
-dotnet run --project .\samples\DispatcherSample\DispatcherSample.csproj
-```
-
-运行单元测试：
-
-```powershell
 dotnet test .\tests\MessageDispatching.Tests\MessageDispatching.Tests.csproj
+dotnet run --project .\samples\DispatcherSample\DispatcherSample.csproj
+dotnet run --project .\benchmarks\MessageDispatching.ScalingBenchmarks\MessageDispatching.ScalingBenchmarks.csproj
 ```
 
-示例期望行为：
-
-- `hot-a` 内部序号递增。
-- `hot-b` 内部序号递增。
-- `cold-c` 内部序号递增。
-- 输出的 key 之间会交错，说明跨 key 并发处理。
-- 最后会输出类似 `max concurrency observed: 2`，具体峰值取决于采样时序和当前负载。
-- 启用动态扩缩容的示例会输出类似 `peak workers observed: 2` 和 `workers after scale down: 1`，说明 worker 从初始 `Parallelism = 1` 扩容到了多个，并在空闲后回落到下限。
-- no-key 示例会输出类似 `no-key peak workers observed: 2` 和 `no-key workers after scale down: 1`，说明无 key 转换 dispatcher 也支持动态扩缩容。
-- no-key 固定单 worker 示例会输出类似 `no-key mpsc published count: 4` 和 `no-key mpsc max concurrency observed: 1`，验证 MPSC 模式。
-
-## 后续待补
-
-建议后续补充以下内容：
-
-- 正式 `MessageBus` 注册表。
-- `MessageType -> protobuf parser -> keySelector -> dispatcher` 的注册 API。
-- 单元测试扩展：
-  - `KeyBatchSize` 让步。
-  - 新 key 并发首次入队时只创建并发布一个有效 `KeyState`。
-  - 更高并发下的竞态压力测试。
-- 指标：
-  - 每个 `MessageType` 积压数。
-  - 每个 key 的积压数采样。
-  - handler 耗时。
-  - parse 失败数。
-  - handler 失败数。
-  - 死信数。
-- 生产日志接入。
-- 死信队列或失败消息存储。
-- 取消和停机策略接入宿主服务生命周期。
-
-## 当前验证结果
-
-已执行库构建、完整测试、示例构建和运行，并将完整测试套件连续运行 5 次；最后执行 `git diff --check` 和 `git status --short`。
-
-结果：
-
-- 库和示例编译通过，均为 0 warning、0 error。
-- xUnit 完整测试通过：57/57；连续 5 轮均为 57/57 通过。
-- 纯 policy 测试覆盖滚动窗口、低占空比重复 burst、合并 tick 导致的额外 ring-buffer 样本、零利用率阈值、双向 cooldown、长采样间隔重置、最新状态门槛和异常 gauge clamp。
-- 示例运行通过，每个 key 内部顺序保持递增，不同 key 实际发生并行处理。
-- keyed observer 同步输出扩容和缩容通知；本次观察到 worker 从 1 扩到 3，再缩到 1，其中缩容发生时 `PendingMessages` 仍大于 0。
-- no-key observer 同步输出扩容和缩容通知；本次观察到 worker 从 1 扩到 4，再在持续处理尾部消息时逐步缩到 1，24 条 raw packet 全部转换并发布。
-- no-key MPSC 验证通过：`Parallelism = 1` 且未启用动态扩容时，观察到 `no-key mpsc published count: 4`、`no-key mpsc max concurrency observed: 1`。
-- `git diff --check` 通过；仅输出 Git 的 LF/CRLF 工作区转换提示。
+并发退休、controller cancellation、Complete/Enqueue 竞态和 observer 时序需要通过重复运行完整测试套件验证。

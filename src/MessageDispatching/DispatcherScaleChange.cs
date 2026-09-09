@@ -5,7 +5,7 @@ public sealed class DispatcherScaleChange
     internal DispatcherScaleChange(
         int previousWorkerCount,
         int currentWorkerCount,
-        DispatcherStats stats)
+        DispatcherScalingStats stats)
     {
         PreviousWorkerCount = previousWorkerCount;
         CurrentWorkerCount = currentWorkerCount;
@@ -18,5 +18,5 @@ public sealed class DispatcherScaleChange
 
     public bool IsScaleUp => CurrentWorkerCount > PreviousWorkerCount;
 
-    public DispatcherStats Stats { get; }
+    public DispatcherScalingStats Stats { get; }
 }

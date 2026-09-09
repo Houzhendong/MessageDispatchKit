@@ -1,12 +1,12 @@
 namespace MessageDispatching;
 
-public readonly record struct DispatcherStats(
+public readonly record struct DispatcherScalingStats(
     long PendingMessages,
     long CompletedMessages,
     int WorkerCount,
     int DesiredWorkerCount,
     int BusyWorkers,
-    long QueuedMessageCount,
+    long ReadyWorkItemCount,
     double Throughput,
     double SmoothedThroughput,
     bool IsSaturated,

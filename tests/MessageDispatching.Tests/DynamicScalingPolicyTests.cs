@@ -6,289 +6,532 @@ namespace MessageDispatching.Tests;
 public sealed class DynamicScalingPolicyTests
 {
     [Fact]
-    public void WindowMustFillBeforeScaling()
+    public void FirstSampleBaselinesAndThroughputUsesActualElapsedTime()
+    {
+        var policy = CreatePolicy(maxParallelism: 1);
+
+        var baseline = Observe(policy, 10, 100, workers: 1, desired: 1, busy: 0, ready: 0);
+        var first = Observe(policy, 10.5, 150, workers: 1, desired: 1, busy: 0, ready: 0);
+        var second = Observe(policy, 12, 300, workers: 1, desired: 1, busy: 0, ready: 0);
+
+        Assert.Equal(0, baseline.Throughput);
+        Assert.Equal(0, baseline.SmoothedThroughput);
+        Assert.Equal(100, first.Throughput, 10);
+        Assert.Equal(100, first.SmoothedThroughput, 10);
+        Assert.Equal(100, second.Throughput, 10);
+    }
+
+    [Fact]
+    public void EwmaStartsWithFirstValidRawSampleThenBlends()
+    {
+        var policy = CreatePolicy(maxParallelism: 1, smoothingFactor: 0.25);
+
+        Observe(policy, 0, 0, workers: 1, desired: 1, busy: 0, ready: 0);
+        var first = Observe(policy, 1, 100, workers: 1, desired: 1, busy: 0, ready: 0);
+        var second = Observe(policy, 2, 300, workers: 1, desired: 1, busy: 0, ready: 0);
+
+        Assert.Equal(100, first.Throughput, 10);
+        Assert.Equal(100, first.SmoothedThroughput, 10);
+        Assert.Equal(200, second.Throughput, 10);
+        Assert.Equal(125, second.SmoothedThroughput, 10);
+    }
+
+    [Theory]
+    [InlineData(0, 0, 1, false)]
+    [InlineData(2, 1, 1, false)]
+    [InlineData(2, 2, 0, false)]
+    [InlineData(2, 2, 1, true)]
+    [InlineData(2, 3, 1, true)]
+    public void SaturationUsesActualWorkersBusyWorkersAndRunnableWork(
+        int workers,
+        int busy,
+        long ready,
+        bool expected)
     {
         var policy = CreatePolicy();
 
-        Assert.Equal(DynamicScaleDecision.None, Observe(policy, 0, 2, 2, 1));
-        Assert.Equal(DynamicScaleDecision.None, Observe(policy, 100, 2, 2, 1));
-        Assert.Equal(DynamicScaleDecision.None, Observe(policy, 200, 2, 2, 1));
-        Assert.Equal(DynamicScaleDecision.None, Observe(policy, 300, 2, 2, 1));
-        Assert.Equal(DynamicScaleDecision.ScaleUp, Observe(policy, 400, 2, 2, 1));
+        var result = Observe(policy, 0, 0, workers, workers, busy, ready);
+
+        Assert.Equal(expected, result.IsSaturated);
     }
 
     [Fact]
-    public void RepeatedLowDutyBurstsDoNotAccumulateScaleUpDecisions()
+    public void PositiveBaselineUsesProportionalScaleUpStep()
     {
-        var policy = CreatePolicy();
+        var policy = CreatePolicy(maxParallelism: 32, smoothingFactor: 1);
 
-        for (var sample = 0; sample < 40; sample++)
-        {
-            var saturated = sample % 4 == 0;
-            Assert.Equal(
-                DynamicScaleDecision.None,
-                Observe(
-                    policy,
-                    sample * 100,
-                    2,
-                    saturated ? 2 : 1,
-                    saturated ? 1 : 0));
-        }
+        Observe(policy, 0, 0, workers: 8, desired: 8, busy: 8, ready: 20);
+        var result = Observe(policy, 1, 800, workers: 8, desired: 8, busy: 8, ready: 20);
+
+        Assert.Equal(ScalingReason.ProbeUp, result.Reason);
+        Assert.Equal(10, result.DesiredWorkerCount);
+        Assert.Equal(ScalingState.ProbeConvergence, policy.State);
     }
 
     [Fact]
-    public void LatestSampleMustStillBeSaturatedForScaleUp()
+    public void ZeroBaselineUsesSingleWorkerScaleUpStep()
     {
-        var policy = CreatePolicy(upThreshold: 0.75);
+        var policy = CreatePolicy(maxParallelism: 32, smoothingFactor: 1);
 
-        Observe(policy, 0, 2, 2, 1);
-        Observe(policy, 100, 2, 2, 1);
-        Observe(policy, 200, 2, 2, 1);
-        Observe(policy, 300, 2, 2, 1);
+        Observe(policy, 0, 0, workers: 8, desired: 8, busy: 8, ready: 20);
+        var result = Observe(policy, 1, 0, workers: 8, desired: 8, busy: 8, ready: 20);
 
-        Assert.Equal(DynamicScaleDecision.None, Observe(policy, 400, 2, 1, 0));
+        Assert.Equal(ScalingReason.ProbeUp, result.Reason);
+        Assert.Equal(9, result.DesiredWorkerCount);
+        Assert.Equal(0, result.SmoothedThroughput);
     }
 
-    [Fact]
-    public void DelayedTicksExpireStaleTimeInsteadOfWeightingSamplesEqually()
+    [Theory]
+    [InlineData(9, 20, 9)]
+    [InlineData(32, 1, 9)]
+    public void ScaleUpTargetIsCappedByMaximumAndRunnableParallelism(
+        int maxParallelism,
+        long ready,
+        int expectedTarget)
     {
-        var policy = CreatePolicy(upThreshold: 0.75);
+        var policy = CreatePolicy(maxParallelism: maxParallelism, smoothingFactor: 1);
 
-        Observe(policy, 0, 2, 2, 1);
-        Observe(policy, 100, 2, 2, 1);
-        Observe(policy, 200, 2, 1, 0);
+        Observe(policy, 0, 0, workers: 8, desired: 8, busy: 8, ready: ready);
+        var result = Observe(policy, 1, 800, workers: 8, desired: 8, busy: 8, ready: ready);
 
-        Assert.Equal(DynamicScaleDecision.None, Observe(policy, 500, 2, 2, 1));
-        Assert.Equal(DynamicScaleDecision.None, Observe(policy, 600, 2, 2, 1));
+        Assert.Equal(ScalingReason.ProbeUp, result.Reason);
+        Assert.Equal(expectedTarget, result.DesiredWorkerCount);
     }
 
-    [Fact]
-    public void CoalescedTimerTicksCanExceedTheNominalRingCapacity()
+    [Theory]
+    [InlineData(8, 9, 8, 20, 32)]
+    [InlineData(8, 8, 7, 20, 32)]
+    [InlineData(8, 8, 8, 0, 32)]
+    [InlineData(8, 8, 8, 20, 8)]
+    public void StableProbeRequiresConvergenceSaturationAndAvailableCapacity(
+        int workers,
+        int desired,
+        int busy,
+        long ready,
+        int maxParallelism)
     {
-        var options = new DispatcherOptions
-        {
-            Parallelism = 1,
-            MaxParallelism = 4,
-            ScaleInterval = TimeSpan.FromMilliseconds(20),
-            ScaleObservationWindow = TimeSpan.FromMilliseconds(100),
-            ScaleUpSaturationThreshold = 0.80,
-            ScaleDownUtilizationThreshold = 0.70,
-            ScaleUpCooldown = TimeSpan.Zero,
-            ScaleDownCooldown = TimeSpan.Zero
-        };
-        options.Validate();
-        var policy = new DynamicScalingPolicy(options);
-        var timestamps = new[]
-        {
-            0d,
-            18.941,
-            73.909,
-            74.136,
-            77.988,
-            98.308,
-            117.439,
-            137.810,
-            158.064
-        };
+        var policy = CreatePolicy(maxParallelism: maxParallelism, smoothingFactor: 1);
 
-        var decision = DynamicScaleDecision.None;
-        foreach (var milliseconds in timestamps)
-        {
-            decision = policy.Observe(1, 1, 1, false, Timestamp(milliseconds));
-        }
+        Observe(policy, 0, 0, workers, desired, busy, ready);
+        var result = Observe(policy, 1, 100, workers, desired, busy, ready);
 
-        Assert.Equal(DynamicScaleDecision.ScaleUp, decision);
+        Assert.Equal(ScalingReason.None, result.Reason);
+        Assert.Equal(desired, result.DesiredWorkerCount);
+        Assert.Equal(ScalingState.Stable, policy.State);
     }
 
     [Fact]
-    public void SustainedLowUtilizationScalesDownWithoutCompleteIdleness()
-    {
-        var policy = CreatePolicy(downThreshold: 0.5);
-
-        Assert.Equal(DynamicScaleDecision.None, Observe(policy, 0, 4, 2, 0));
-        Assert.Equal(DynamicScaleDecision.None, Observe(policy, 100, 4, 2, 0));
-        Assert.Equal(DynamicScaleDecision.None, Observe(policy, 200, 4, 2, 0));
-        Assert.Equal(DynamicScaleDecision.None, Observe(policy, 300, 4, 2, 0));
-        Assert.Equal(DynamicScaleDecision.ScaleDown, Observe(policy, 400, 4, 2, 0));
-    }
-
-    [Fact]
-    public void ZeroUtilizationThresholdScalesDownAfterBusySamplesExpire()
-    {
-        var policy = CreatePolicy(downThreshold: 0);
-
-        for (var milliseconds = 0; milliseconds <= 400; milliseconds += 100)
-        {
-            Assert.NotEqual(
-                DynamicScaleDecision.ScaleDown,
-                Observe(policy, milliseconds, 3, 1, 0));
-        }
-
-        for (var milliseconds = 500; milliseconds < 900; milliseconds += 100)
-        {
-            Assert.Equal(
-                DynamicScaleDecision.None,
-                Observe(policy, milliseconds, 3, 0, 0));
-        }
-
-        Assert.Equal(DynamicScaleDecision.ScaleDown, Observe(policy, 900, 3, 0, 0));
-    }
-
-    [Fact]
-    public void LatestSampleMustHaveSpareCapacityAndNoQueueForScaleDown()
-    {
-        var policy = CreatePolicy(upThreshold: 1, downThreshold: 0.75);
-
-        Observe(policy, 0, 4, 1, 0);
-        Observe(policy, 100, 4, 1, 0);
-        Observe(policy, 200, 4, 1, 0);
-        Observe(policy, 300, 4, 1, 0);
-
-        Assert.Equal(DynamicScaleDecision.None, Observe(policy, 400, 4, 4, 1));
-    }
-
-    [Fact]
-    public void ScaleChangeCooldownAppliesToBothDirections()
+    public void ProbeWaitsForLaterTargetConvergenceWarmupAndMeasurementSamples()
     {
         var policy = CreatePolicy(
-            upThreshold: 0.5,
-            downThreshold: 0.25,
-            upCooldown: TimeSpan.FromMilliseconds(500),
-            downCooldown: TimeSpan.FromMilliseconds(700));
+            maxParallelism: 8,
+            minimumGain: 0.5,
+            smoothingFactor: 1,
+            warmupSamples: 2);
 
-        for (var milliseconds = 0; milliseconds <= 300; milliseconds += 100)
-        {
-            Observe(policy, milliseconds, 2, 2, 1);
-        }
+        Observe(policy, 0, 0, workers: 2, desired: 2, busy: 2, ready: 4);
+        var started = Observe(policy, 1, 100, workers: 2, desired: 2, busy: 2, ready: 4);
+        var waiting = Observe(policy, 2, 200, workers: 2, desired: 3, busy: 2, ready: 4);
+        var converged = Observe(policy, 3, 300, workers: 3, desired: 3, busy: 3, ready: 4);
+        var warmup1 = Observe(policy, 4, 450, workers: 3, desired: 3, busy: 3, ready: 4);
+        var warmup2 = Observe(policy, 5, 600, workers: 3, desired: 3, busy: 3, ready: 4);
+        var measured = Observe(policy, 6, 750, workers: 3, desired: 3, busy: 3, ready: 4);
 
-        policy.RecordScaleChange(Timestamp(300));
-
-        for (var milliseconds = 400; milliseconds < 800; milliseconds += 100)
-        {
-            Assert.Equal(
-                DynamicScaleDecision.None,
-                Observe(policy, milliseconds, 3, 3, 1));
-        }
-
-        Assert.Equal(DynamicScaleDecision.ScaleUp, Observe(policy, 800, 3, 3, 1));
-        policy.RecordScaleChange(Timestamp(800));
-
-        for (var milliseconds = 900; milliseconds < 1500; milliseconds += 100)
-        {
-            Assert.Equal(
-                DynamicScaleDecision.None,
-                Observe(policy, milliseconds, 3, 0, 0));
-        }
-
-        Assert.Equal(DynamicScaleDecision.ScaleDown, Observe(policy, 1500, 3, 0, 0));
+        Assert.Equal(ScalingReason.ProbeUp, started.Reason);
+        Assert.Equal(ScalingReason.None, waiting.Reason);
+        Assert.Equal(ScalingReason.None, converged.Reason);
+        Assert.Equal(ScalingReason.None, warmup1.Reason);
+        Assert.Equal(ScalingReason.None, warmup2.Reason);
+        Assert.Equal(ScalingReason.ProbeAccepted, measured.Reason);
+        Assert.Equal(3, measured.DesiredWorkerCount);
+        Assert.Equal(0.5, measured.ProbeGain!.Value, 10);
+        Assert.Equal(ScalingState.Stable, policy.State);
     }
 
     [Fact]
-    public void PendingRetirementSuppressesAdditionalDecisions()
+    public void PositiveBaselineRejectsGainBelowThreshold()
     {
-        var policy = CreatePolicy(upThreshold: 0.5, downThreshold: 0.25);
+        var policy = CreatePolicy(
+            maxParallelism: 8,
+            minimumGain: 0.02,
+            smoothingFactor: 1,
+            warmupSamples: 0);
 
-        Observe(policy, 0, 2, 2, 1);
-        Observe(policy, 100, 2, 2, 1);
-        Observe(policy, 200, 2, 2, 1);
-        Observe(policy, 300, 2, 2, 1);
+        StartTwoToThreeWorkerProbe(policy);
+        Observe(policy, 2, 200, workers: 3, desired: 3, busy: 3, ready: 2);
+        var result = Observe(policy, 3, 301, workers: 3, desired: 3, busy: 3, ready: 2);
+
+        Assert.Equal(ScalingReason.ProbeRejected, result.Reason);
+        Assert.Equal(2, result.DesiredWorkerCount);
+        Assert.Equal(0.01, result.ProbeGain!.Value, 10);
+        Assert.Equal(ScalingState.RollbackConvergence, policy.State);
+    }
+
+    [Fact]
+    public void NegativeProbeGainIsRejected()
+    {
+        var policy = CreatePolicy(
+            maxParallelism: 8,
+            minimumGain: 0.02,
+            smoothingFactor: 1,
+            warmupSamples: 0);
+
+        StartTwoToThreeWorkerProbe(policy);
+        Observe(policy, 2, 200, workers: 3, desired: 3, busy: 3, ready: 2);
+        var result = Observe(policy, 3, 280, workers: 3, desired: 3, busy: 3, ready: 2);
+
+        Assert.Equal(ScalingReason.ProbeRejected, result.Reason);
+        Assert.Equal(-0.2, result.ProbeGain!.Value, 10);
+        Assert.Equal(2, result.DesiredWorkerCount);
+    }
+
+    [Fact]
+    public void ProbeIsRejectedAsInconclusiveWhenRunnableParallelismFallsBelowTarget()
+    {
+        var policy = CreatePolicy(
+            maxParallelism: 8,
+            minimumGain: 0.02,
+            smoothingFactor: 1,
+            warmupSamples: 0);
+
+        StartTwoToThreeWorkerProbe(policy);
+        Observe(policy, 2, 200, workers: 3, desired: 3, busy: 3, ready: 2);
+        var result = Observe(policy, 3, 400, workers: 3, desired: 3, busy: 1, ready: 1);
+
+        Assert.Equal(ScalingReason.ProbeRejected, result.Reason);
+        Assert.Equal(2, result.DesiredWorkerCount);
+        Assert.Null(result.ProbeGain);
+    }
+
+    [Fact]
+    public void ZeroBaselineAcceptsOnlyPositiveProbeThroughputWithoutGain()
+    {
+        var acceptedPolicy = CreatePolicy(
+            maxParallelism: 8,
+            smoothingFactor: 1,
+            warmupSamples: 0);
+        var rejectedPolicy = CreatePolicy(
+            maxParallelism: 8,
+            smoothingFactor: 1,
+            warmupSamples: 0);
+
+        StartZeroBaselineTwoToThreeWorkerProbe(acceptedPolicy);
+        Observe(acceptedPolicy, 2, 0, workers: 3, desired: 3, busy: 3, ready: 2);
+        var accepted = Observe(
+            acceptedPolicy,
+            3,
+            1,
+            workers: 3,
+            desired: 3,
+            busy: 3,
+            ready: 2);
+
+        StartZeroBaselineTwoToThreeWorkerProbe(rejectedPolicy);
+        Observe(rejectedPolicy, 2, 0, workers: 3, desired: 3, busy: 3, ready: 2);
+        var rejected = Observe(
+            rejectedPolicy,
+            3,
+            0,
+            workers: 3,
+            desired: 3,
+            busy: 3,
+            ready: 2);
+
+        Assert.Equal(ScalingReason.ProbeAccepted, accepted.Reason);
+        Assert.Equal(3, accepted.DesiredWorkerCount);
+        Assert.Null(accepted.ProbeGain);
+        Assert.Equal(ScalingReason.ProbeRejected, rejected.Reason);
+        Assert.Equal(2, rejected.DesiredWorkerCount);
+        Assert.Null(rejected.ProbeGain);
+    }
+
+    [Fact]
+    public void RejectedProbeCooldownStartsOnlyAfterRollbackConverges()
+    {
+        var policy = CreatePolicy(
+            maxParallelism: 8,
+            minimumGain: 0.1,
+            smoothingFactor: 1,
+            warmupSamples: 0,
+            scaleUpCooldown: TimeSpan.FromSeconds(2));
+
+        StartTwoToThreeWorkerProbe(policy);
+        Observe(policy, 2, 200, workers: 3, desired: 3, busy: 3, ready: 2);
+        var rejected = Observe(policy, 3, 300, workers: 3, desired: 3, busy: 3, ready: 2);
+        var rollingBack = Observe(policy, 4, 400, workers: 3, desired: 2, busy: 3, ready: 2);
+        var converged = Observe(policy, 5, 500, workers: 2, desired: 2, busy: 2, ready: 4);
+        var beforeCooldown = Observe(
+            policy,
+            6.9,
+            690,
+            workers: 2,
+            desired: 2,
+            busy: 2,
+            ready: 4);
+        var atCooldown = Observe(
+            policy,
+            7,
+            700,
+            workers: 2,
+            desired: 2,
+            busy: 2,
+            ready: 4);
+
+        Assert.Equal(ScalingReason.ProbeRejected, rejected.Reason);
+        Assert.Equal(ScalingReason.None, rollingBack.Reason);
+        Assert.Equal(ScalingReason.None, converged.Reason);
+        Assert.Equal(ScalingReason.None, beforeCooldown.Reason);
+        Assert.Equal(ScalingReason.ProbeUp, atCooldown.Reason);
+    }
+
+    [Fact]
+    public void ScaleUpCooldownDoesNotBlockIdleScaleDown()
+    {
+        var policy = CreatePolicy(
+            parallelism: 1,
+            maxParallelism: 8,
+            minimumGain: 0.1,
+            smoothingFactor: 1,
+            warmupSamples: 0,
+            scaleUpCooldown: TimeSpan.FromSeconds(10),
+            scaleDownIdleDuration: TimeSpan.FromSeconds(2));
+
+        StartTwoToThreeWorkerProbe(policy);
+        Observe(policy, 2, 200, workers: 3, desired: 3, busy: 3, ready: 2);
+        Observe(policy, 3, 300, workers: 3, desired: 3, busy: 3, ready: 2);
+        Observe(policy, 4, 300, workers: 2, desired: 2, busy: 0, ready: 0);
+
+        var beforeIdleDelay = Observe(
+            policy,
+            5.9,
+            300,
+            workers: 2,
+            desired: 2,
+            busy: 0,
+            ready: 0);
+        var result = Observe(
+            policy,
+            6,
+            300,
+            workers: 2,
+            desired: 2,
+            busy: 0,
+            ready: 0);
+
+        Assert.Equal(ScalingReason.None, beforeIdleDelay.Reason);
+        Assert.Equal(ScalingReason.IdleScaleDown, result.Reason);
+        Assert.Equal(1, result.DesiredWorkerCount);
+    }
+
+    [Fact]
+    public void IdleScaleDownRequiresContinuousDelayResetsAfterConvergenceAndStopsAtFloor()
+    {
+        var policy = CreatePolicy(
+            parallelism: 2,
+            maxParallelism: 8,
+            scaleDownIdleDuration: TimeSpan.FromSeconds(3));
+
+        Observe(policy, 0, 0, workers: 4, desired: 4, busy: 1, ready: 0);
+        Assert.Equal(
+            ScalingReason.None,
+            Observe(policy, 2, 0, workers: 4, desired: 4, busy: 1, ready: 0).Reason);
+
+        Observe(policy, 2.5, 0, workers: 4, desired: 4, busy: 1, ready: 1);
+        Observe(policy, 3, 0, workers: 4, desired: 4, busy: 1, ready: 0);
+        Assert.Equal(
+            ScalingReason.None,
+            Observe(policy, 5.9, 0, workers: 4, desired: 4, busy: 1, ready: 0).Reason);
+
+        var firstScaleDown = Observe(
+            policy,
+            6,
+            0,
+            workers: 4,
+            desired: 4,
+            busy: 1,
+            ready: 0);
+        Assert.Equal(ScalingReason.IdleScaleDown, firstScaleDown.Reason);
+        Assert.Equal(3, firstScaleDown.DesiredWorkerCount);
 
         Assert.Equal(
-            DynamicScaleDecision.None,
-            policy.Observe(2, 2, 1, true, Timestamp(400)));
+            ScalingReason.None,
+            Observe(policy, 7, 0, workers: 4, desired: 3, busy: 1, ready: 0).Reason);
+        Observe(policy, 8, 0, workers: 3, desired: 3, busy: 1, ready: 0);
+        Assert.Equal(
+            ScalingReason.None,
+            Observe(policy, 10.9, 0, workers: 3, desired: 3, busy: 1, ready: 0).Reason);
+
+        var secondScaleDown = Observe(
+            policy,
+            11,
+            0,
+            workers: 3,
+            desired: 3,
+            busy: 1,
+            ready: 0);
+        Assert.Equal(ScalingReason.IdleScaleDown, secondScaleDown.Reason);
+        Assert.Equal(2, secondScaleDown.DesiredWorkerCount);
+
+        Observe(policy, 12, 0, workers: 2, desired: 2, busy: 0, ready: 0);
+        var atFloor = Observe(policy, 20, 0, workers: 2, desired: 2, busy: 0, ready: 0);
+
+        Assert.Equal(ScalingReason.None, atFloor.Reason);
+        Assert.Equal(2, atFloor.DesiredWorkerCount);
     }
 
     [Fact]
-    public void LongSamplingGapClearsTheWindow()
+    public void InvalidSamplesRebaselineWithoutUpdatingEwma()
     {
-        var policy = CreatePolicy();
+        var policy = CreatePolicy(maxParallelism: 1, smoothingFactor: 0.5);
 
-        Observe(policy, 0, 2, 2, 1);
-        Observe(policy, 100, 2, 2, 1);
-        Observe(policy, 200, 2, 2, 1);
+        Observe(policy, 0, 0, workers: 1, desired: 1, busy: 0, ready: 0);
+        var valid = Observe(policy, 1, 100, workers: 1, desired: 1, busy: 0, ready: 0);
+        var duplicateTimestamp = Observe(
+            policy,
+            1,
+            200,
+            workers: 1,
+            desired: 1,
+            busy: 0,
+            ready: 0);
+        var afterTimestampRebaseline = Observe(
+            policy,
+            2,
+            300,
+            workers: 1,
+            desired: 1,
+            busy: 0,
+            ready: 0);
+        var completionRegression = Observe(
+            policy,
+            3,
+            250,
+            workers: 1,
+            desired: 1,
+            busy: 0,
+            ready: 0);
+        var afterCompletionRebaseline = Observe(
+            policy,
+            4,
+            350,
+            workers: 1,
+            desired: 1,
+            busy: 0,
+            ready: 0);
 
-        Assert.Equal(DynamicScaleDecision.None, Observe(policy, 700, 2, 2, 1));
-        Assert.Equal(DynamicScaleDecision.None, Observe(policy, 800, 2, 2, 1));
-        Assert.Equal(DynamicScaleDecision.None, Observe(policy, 900, 2, 2, 1));
-        Assert.Equal(DynamicScaleDecision.None, Observe(policy, 1000, 2, 2, 1));
-        Assert.Equal(DynamicScaleDecision.ScaleUp, Observe(policy, 1100, 2, 2, 1));
+        Assert.Equal(100, valid.SmoothedThroughput, 10);
+        Assert.Equal(0, duplicateTimestamp.Throughput);
+        Assert.Equal(100, duplicateTimestamp.SmoothedThroughput, 10);
+        Assert.Equal(100, afterTimestampRebaseline.Throughput, 10);
+        Assert.Equal(100, afterTimestampRebaseline.SmoothedThroughput, 10);
+        Assert.Equal(0, completionRegression.Throughput);
+        Assert.Equal(100, completionRegression.SmoothedThroughput, 10);
+        Assert.Equal(100, afterCompletionRebaseline.Throughput, 10);
     }
 
     [Fact]
-    public void InvalidGaugeValuesAreClamped()
+    public void InvalidSampleDuringActiveProbeFailsSafeToRollback()
     {
-        var policy = CreatePolicy(upThreshold: 1, downThreshold: 0.5);
+        var policy = CreatePolicy(
+            maxParallelism: 8,
+            smoothingFactor: 1,
+            warmupSamples: 1);
 
-        Observe(policy, 0, 2, 99, 1);
-        Observe(policy, 100, 2, 99, 1);
-        Observe(policy, 200, 2, 99, 1);
-        Observe(policy, 300, 2, 99, 1);
-        Assert.Equal(DynamicScaleDecision.ScaleUp, Observe(policy, 400, 2, 99, 1));
+        StartTwoToThreeWorkerProbe(policy);
+        Observe(policy, 2, 200, workers: 3, desired: 3, busy: 3, ready: 2);
+        var result = Observe(policy, 2, 250, workers: 3, desired: 3, busy: 3, ready: 2);
 
-        var downPolicy = CreatePolicy(upThreshold: 1, downThreshold: 0.5);
-        Observe(downPolicy, 0, 2, -1, -1);
-        Observe(downPolicy, 100, 2, -1, -1);
-        Observe(downPolicy, 200, 2, -1, -1);
-        Observe(downPolicy, 300, 2, -1, -1);
-        Assert.Equal(DynamicScaleDecision.ScaleDown, Observe(downPolicy, 400, 2, -1, -1));
+        Assert.Equal(ScalingReason.ProbeRejected, result.Reason);
+        Assert.Equal(2, result.DesiredWorkerCount);
+        Assert.Equal(0, result.Throughput);
+        Assert.Null(result.ProbeGain);
+        Assert.Equal(ScalingState.RollbackConvergence, policy.State);
     }
 
     [Fact]
-    public void FloorAndCeilingPreventScalingBeyondConfiguredBounds()
+    public void InvalidSampleBreaksContinuousIdleDuration()
     {
-        var upPolicy = CreatePolicy(
+        var policy = CreatePolicy(
             parallelism: 1,
-            maxParallelism: 2,
-            upThreshold: 0.5,
-            downThreshold: 0.25);
-        var downPolicy = CreatePolicy(parallelism: 2, maxParallelism: 4, downThreshold: 0.5);
+            maxParallelism: 4,
+            scaleDownIdleDuration: TimeSpan.FromSeconds(3));
 
-        for (var milliseconds = 0; milliseconds <= 400; milliseconds += 100)
-        {
-            Assert.NotEqual(
-                DynamicScaleDecision.ScaleUp,
-                Observe(upPolicy, milliseconds, 2, 2, 1));
-            Assert.NotEqual(
-                DynamicScaleDecision.ScaleDown,
-                Observe(downPolicy, milliseconds, 2, 0, 0));
-        }
+        Observe(policy, 0, 10, workers: 3, desired: 3, busy: 0, ready: 0);
+        Observe(policy, 2, 5, workers: 3, desired: 3, busy: 0, ready: 0);
+        var restarted = Observe(policy, 4, 5, workers: 3, desired: 3, busy: 0, ready: 0);
+        var beforeDelay = Observe(policy, 6.9, 5, workers: 3, desired: 3, busy: 0, ready: 0);
+        var afterDelay = Observe(policy, 7, 5, workers: 3, desired: 3, busy: 0, ready: 0);
+
+        Assert.Equal(ScalingReason.None, restarted.Reason);
+        Assert.Equal(ScalingReason.None, beforeDelay.Reason);
+        Assert.Equal(ScalingReason.IdleScaleDown, afterDelay.Reason);
+        Assert.Equal(2, afterDelay.DesiredWorkerCount);
+    }
+
+    private static void StartTwoToThreeWorkerProbe(DynamicScalingPolicy policy)
+    {
+        Observe(policy, 0, 0, workers: 2, desired: 2, busy: 2, ready: 2);
+        var started = Observe(policy, 1, 100, workers: 2, desired: 2, busy: 2, ready: 2);
+        Assert.Equal(ScalingReason.ProbeUp, started.Reason);
+        Assert.Equal(3, started.DesiredWorkerCount);
+    }
+
+    private static void StartZeroBaselineTwoToThreeWorkerProbe(DynamicScalingPolicy policy)
+    {
+        Observe(policy, 0, 0, workers: 2, desired: 2, busy: 2, ready: 2);
+        var started = Observe(policy, 1, 0, workers: 2, desired: 2, busy: 2, ready: 2);
+        Assert.Equal(ScalingReason.ProbeUp, started.Reason);
+        Assert.Equal(3, started.DesiredWorkerCount);
     }
 
     private static DynamicScalingPolicy CreatePolicy(
         int parallelism = 1,
-        int maxParallelism = 4,
-        double upThreshold = 0.75,
-        double downThreshold = 0.5,
-        TimeSpan? upCooldown = null,
-        TimeSpan? downCooldown = null)
+        int maxParallelism = 16,
+        double minimumGain = 0.02,
+        double smoothingFactor = 0.25,
+        int warmupSamples = 1,
+        TimeSpan? scaleUpCooldown = null,
+        TimeSpan? scaleDownIdleDuration = null)
     {
         var options = new DispatcherOptions
         {
             Parallelism = parallelism,
             MaxParallelism = maxParallelism,
-            ScaleInterval = TimeSpan.FromMilliseconds(100),
-            ScaleObservationWindow = TimeSpan.FromMilliseconds(400),
-            ScaleUpSaturationThreshold = upThreshold,
-            ScaleDownUtilizationThreshold = downThreshold,
-            ScaleUpCooldown = upCooldown ?? TimeSpan.Zero,
-            ScaleDownCooldown = downCooldown ?? TimeSpan.Zero
+            DynamicScaling = new DynamicScalingOptions
+            {
+                SampleInterval = TimeSpan.FromMilliseconds(100),
+                MinimumUsefulThroughputGain = minimumGain,
+                ThroughputSmoothingFactor = smoothingFactor,
+                ProbeWarmupSamples = warmupSamples,
+                ScaleUpCooldown = scaleUpCooldown ?? TimeSpan.Zero,
+                ScaleDownIdleDuration = scaleDownIdleDuration ?? TimeSpan.FromSeconds(30)
+            }
         };
         options.Validate();
         return new DynamicScalingPolicy(options);
     }
 
-    private static DynamicScaleDecision Observe(
+    private static ScalingResult Observe(
         DynamicScalingPolicy policy,
-        int milliseconds,
+        double seconds,
+        long completed,
         int workers,
+        int desired,
         int busy,
-        int queued)
+        long ready)
     {
-        return policy.Observe(workers, busy, queued, false, Timestamp(milliseconds));
+        return policy.Observe(
+            new ScalingSnapshot(
+                workers,
+                desired,
+                busy,
+                ready,
+                completed,
+                Timestamp(seconds)));
     }
 
-    private static long Timestamp(double milliseconds)
+    private static long Timestamp(double seconds)
     {
-        return (long)(Stopwatch.Frequency * (milliseconds / 1000d));
+        return (long)(Stopwatch.Frequency * seconds);
     }
 }
