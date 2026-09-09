@@ -1,12 +1,13 @@
 namespace MessageDispatching;
 
-public readonly record struct DispatcherStats(
+public readonly record struct KeyedDispatcherStats(
     long PendingMessages,
     long CompletedMessages,
+    int KeyCount,
     int WorkerCount,
     int DesiredWorkerCount,
     int BusyWorkers,
-    long QueuedMessageCount,
+    int ReadyKeyCount,
     double Throughput,
     double SmoothedThroughput,
     bool IsSaturated,

@@ -2,234 +2,532 @@ using System.Diagnostics;
 
 namespace MessageDispatching;
 
-internal enum DynamicScaleDecision
+internal readonly record struct ScalingSnapshot(
+    int WorkerCount,
+    int DesiredWorkerCount,
+    int BusyWorkers,
+    long RunnableWorkItemCount,
+    long CompletedMessages,
+    long Timestamp);
+
+internal readonly record struct ScalingResult(
+    int DesiredWorkerCount,
+    ScalingReason Reason,
+    double Throughput,
+    double SmoothedThroughput,
+    bool IsSaturated,
+    double? ProbeGain);
+
+internal enum ScalingReason
 {
     None,
-    ScaleUp,
-    ScaleDown
+    ProbeUp,
+    ProbeAccepted,
+    ProbeRejected,
+    IdleScaleDown
+}
+
+internal enum ScalingState
+{
+    Stable,
+    ProbeConvergence,
+    ProbeWarmup,
+    ProbeMeasure,
+    RollbackConvergence,
+    ScaleDownConvergence
 }
 
 internal sealed class DynamicScalingPolicy
 {
-    private const long NoTimestamp = long.MinValue;
+    private readonly int _minimumWorkerCount;
+    private readonly int _maximumWorkerCount;
+    private readonly double _minimumUsefulThroughputGain;
+    private readonly double _throughputSmoothingFactor;
+    private readonly int _probeWarmupSamples;
+    private readonly TimeSpan _scaleUpCooldown;
+    private readonly TimeSpan _scaleDownIdleDuration;
 
-    private readonly record struct TimedSample(
-        long StartTimestamp,
-        long EndTimestamp,
-        double Utilization,
-        double Saturation);
+    private ScalingState _state;
+    private bool _hasSampleBaseline;
+    private long _lastCompletedMessages;
+    private long _lastTimestamp;
+    private bool _hasSmoothedThroughput;
+    private double _smoothedThroughput;
 
-    private readonly DispatcherOptions _options;
-    private readonly long _windowTimestampTicks;
-    private readonly Queue<TimedSample> _samples;
-    private double _weightedUtilization;
-    private double _weightedSaturation;
-    private long _coveredTimestampTicks;
-    private int _nonZeroUtilizationSampleCount;
-    private int _saturatedSampleCount;
-    private long _trimmedHeadStartTimestamp = NoTimestamp;
-    private long _lastSampleTimestamp = NoTimestamp;
-    private long _lastScaleChangeTimestamp = NoTimestamp;
-    private double _lastUtilization;
-    private double _lastSaturation;
+    private int _baselineWorkerCount;
+    private double _baselineThroughput;
+    private int _probeTargetWorkerCount;
+    private int _warmupSamplesRemaining;
+
+    private int _scaleDownTargetWorkerCount;
+    private bool _hasIdleStart;
+    private long _idleStartTimestamp;
+    private bool _hasCooldownStart;
+    private long _cooldownStartTimestamp;
 
     public DynamicScalingPolicy(DispatcherOptions options)
     {
-        _options = options;
-        _windowTimestampTicks = checked((long)Math.Ceiling(
-            options.ScaleObservationWindow.TotalSeconds * Stopwatch.Frequency));
+        ArgumentNullException.ThrowIfNull(options);
+        ArgumentNullException.ThrowIfNull(options.DynamicScaling);
 
-        var expectedSamples = options.ScaleObservationWindow.Ticks / options.ScaleInterval.Ticks;
-        if (options.ScaleObservationWindow.Ticks % options.ScaleInterval.Ticks != 0)
-        {
-            expectedSamples++;
-        }
-
-        // Start near the nominal sample count. Queue<T> uses an array-backed ring internally and
-        // grows automatically when delayed PeriodicTimer continuations cluster observations.
-        _samples = new Queue<TimedSample>(checked((int)expectedSamples + 1));
+        _minimumWorkerCount = options.Parallelism;
+        _maximumWorkerCount = options.EffectiveMaxParallelism;
+        _minimumUsefulThroughputGain = options.DynamicScaling.MinimumUsefulThroughputGain;
+        _throughputSmoothingFactor = options.DynamicScaling.ThroughputSmoothingFactor;
+        _probeWarmupSamples = options.DynamicScaling.ProbeWarmupSamples;
+        _scaleUpCooldown = options.DynamicScaling.ScaleUpCooldown;
+        _scaleDownIdleDuration = options.DynamicScaling.ScaleDownIdleDuration;
     }
 
-    public DynamicScaleDecision Observe(
-        int workerCount,
-        int busyWorkers,
-        int queuedWorkItems,
-        bool retirementPending,
-        long timestamp)
+    internal ScalingState State => _state;
+
+    public ScalingResult Observe(ScalingSnapshot snapshot)
     {
-        var normalizedWorkerCount = Math.Max(0, workerCount);
-        var normalizedBusyWorkers = normalizedWorkerCount == 0
-            ? 0
-            : Math.Clamp(busyWorkers, 0, normalizedWorkerCount);
-        var normalizedQueuedWorkItems = Math.Max(0, queuedWorkItems);
-        var utilization = normalizedWorkerCount == 0
-            ? 0d
-            : (double)normalizedBusyWorkers / normalizedWorkerCount;
-        var saturated = normalizedWorkerCount > 0 &&
-            normalizedBusyWorkers == normalizedWorkerCount &&
-            normalizedQueuedWorkItems > 0;
+        var isSaturated = IsSaturated(snapshot);
 
-        if (_lastSampleTimestamp == NoTimestamp)
+        if (!_hasSampleBaseline)
         {
-            RecordLatestSample(timestamp, utilization, saturated);
-            return DynamicScaleDecision.None;
+            RebaselineSample(snapshot);
+            StartIdlePeriodIfEligible(snapshot);
+            return CreateResult(
+                snapshot.DesiredWorkerCount,
+                ScalingReason.None,
+                0,
+                isSaturated,
+                null);
         }
 
-        if (timestamp <= _lastSampleTimestamp ||
-            Stopwatch.GetElapsedTime(_lastSampleTimestamp, timestamp) >
-            _options.ScaleObservationWindow)
+        if (snapshot.Timestamp <= _lastTimestamp ||
+            snapshot.CompletedMessages < _lastCompletedMessages)
         {
-            ResetSamples();
-            RecordLatestSample(timestamp, utilization, saturated);
-            return DynamicScaleDecision.None;
-        }
+            RebaselineSample(snapshot);
+            ResetIdlePeriod();
 
-        TrimExpiredSamples(timestamp - _windowTimestampTicks);
-        AddElapsedSample(timestamp);
-        RecordLatestSample(timestamp, utilization, saturated);
-
-        if (_coveredTimestampTicks < _windowTimestampTicks || retirementPending)
-        {
-            return DynamicScaleDecision.None;
-        }
-
-        var averageSaturation = _weightedSaturation / _coveredTimestampTicks;
-        if (normalizedWorkerCount < _options.EffectiveMaxParallelism &&
-            saturated &&
-            averageSaturation >= _options.ScaleUpSaturationThreshold &&
-            IsCooldownElapsed(timestamp, _options.ScaleUpCooldown))
-        {
-            return DynamicScaleDecision.ScaleUp;
-        }
-
-        var averageUtilization = _weightedUtilization / _coveredTimestampTicks;
-        if (normalizedWorkerCount > _options.Parallelism &&
-            normalizedBusyWorkers < normalizedWorkerCount &&
-            normalizedQueuedWorkItems == 0 &&
-            averageUtilization <= _options.ScaleDownUtilizationThreshold &&
-            IsCooldownElapsed(timestamp, _options.ScaleDownCooldown))
-        {
-            return DynamicScaleDecision.ScaleDown;
-        }
-
-        return DynamicScaleDecision.None;
-    }
-
-    public void RecordScaleChange(long timestamp)
-    {
-        _lastScaleChangeTimestamp = timestamp;
-    }
-
-    private void AddElapsedSample(long timestamp)
-    {
-        var duration = timestamp - _lastSampleTimestamp;
-        var sample = new TimedSample(
-            _lastSampleTimestamp,
-            timestamp,
-            _lastUtilization,
-            _lastSaturation);
-        _samples.Enqueue(sample);
-        _coveredTimestampTicks += duration;
-        _weightedUtilization += duration * sample.Utilization;
-        _weightedSaturation += duration * sample.Saturation;
-
-        if (sample.Utilization > 0)
-        {
-            _nonZeroUtilizationSampleCount++;
-        }
-
-        if (sample.Saturation > 0)
-        {
-            _saturatedSampleCount++;
-        }
-    }
-
-    private void TrimExpiredSamples(long cutoffTimestamp)
-    {
-        while (_samples.Count > 0)
-        {
-            var sample = _samples.Peek();
-            var sampleStartTimestamp = _trimmedHeadStartTimestamp == NoTimestamp
-                ? sample.StartTimestamp
-                : _trimmedHeadStartTimestamp;
-
-            if (sample.EndTimestamp <= cutoffTimestamp)
+            if (IsProbeActive())
             {
-                _samples.Dequeue();
-                RemoveDuration(sample, sample.EndTimestamp - sampleStartTimestamp);
-                _trimmedHeadStartTimestamp = NoTimestamp;
-
-                if (sample.Utilization > 0)
-                {
-                    _nonZeroUtilizationSampleCount--;
-                }
-
-                if (sample.Saturation > 0)
-                {
-                    _saturatedSampleCount--;
-                }
-
-                continue;
+                return RejectProbe(0, isSaturated, null);
             }
 
-            if (sampleStartTimestamp < cutoffTimestamp)
+            return CreateResult(
+                GetDesiredWorkerCount(snapshot),
+                ScalingReason.None,
+                0,
+                isSaturated,
+                null);
+        }
+
+        var elapsedSeconds = Stopwatch.GetElapsedTime(_lastTimestamp, snapshot.Timestamp).TotalSeconds;
+        var completedDelta = (double)snapshot.CompletedMessages - _lastCompletedMessages;
+        var throughput = completedDelta / elapsedSeconds;
+
+        _lastTimestamp = snapshot.Timestamp;
+        _lastCompletedMessages = snapshot.CompletedMessages;
+        UpdateSmoothedThroughput(throughput);
+
+        return _state switch
+        {
+            ScalingState.Stable => ObserveStable(snapshot, throughput, isSaturated),
+            ScalingState.ProbeConvergence => ObserveProbeConvergence(snapshot, throughput, isSaturated),
+            ScalingState.ProbeWarmup => ObserveProbeWarmup(snapshot, throughput, isSaturated),
+            ScalingState.ProbeMeasure => ObserveProbeMeasure(snapshot, throughput, isSaturated),
+            ScalingState.RollbackConvergence => ObserveRollbackConvergence(
+                snapshot,
+                throughput,
+                isSaturated),
+            ScalingState.ScaleDownConvergence => ObserveScaleDownConvergence(
+                snapshot,
+                throughput,
+                isSaturated),
+            _ => throw new InvalidOperationException($"Unknown scaling state: {_state}.")
+        };
+    }
+
+    private ScalingResult ObserveStable(
+        ScalingSnapshot snapshot,
+        double throughput,
+        bool isSaturated)
+    {
+        if (snapshot.WorkerCount != snapshot.DesiredWorkerCount)
+        {
+            ResetIdlePeriod();
+            return CreateResult(
+                snapshot.DesiredWorkerCount,
+                ScalingReason.None,
+                throughput,
+                isSaturated,
+                null);
+        }
+
+        if (IsIdleScaleDownEligible(snapshot))
+        {
+            if (!_hasIdleStart)
             {
-                var removedDuration = cutoffTimestamp - sampleStartTimestamp;
-                RemoveDuration(sample, removedDuration);
-                _trimmedHeadStartTimestamp = cutoffTimestamp;
+                _hasIdleStart = true;
+                _idleStartTimestamp = snapshot.Timestamp;
+            }
+            else if (HasElapsed(_idleStartTimestamp, snapshot.Timestamp, _scaleDownIdleDuration))
+            {
+                _scaleDownTargetWorkerCount = snapshot.DesiredWorkerCount - 1;
+                _state = ScalingState.ScaleDownConvergence;
+                ResetIdlePeriod();
+
+                return CreateResult(
+                    _scaleDownTargetWorkerCount,
+                    ScalingReason.IdleScaleDown,
+                    throughput,
+                    isSaturated,
+                    null);
+            }
+        }
+        else
+        {
+            ResetIdlePeriod();
+        }
+
+        if (!isSaturated || !_hasSmoothedThroughput)
+        {
+            return CreateResult(
+                snapshot.DesiredWorkerCount,
+                ScalingReason.None,
+                throughput,
+                isSaturated,
+                null);
+        }
+
+        if (!IsScaleUpCooldownElapsed(snapshot.Timestamp))
+        {
+            return CreateResult(
+                snapshot.DesiredWorkerCount,
+                ScalingReason.None,
+                throughput,
+                isSaturated,
+                null);
+        }
+
+        _hasCooldownStart = false;
+
+        var runnableParallelism = GetRunnableParallelism(snapshot);
+        if (snapshot.WorkerCount >= _maximumWorkerCount ||
+            runnableParallelism <= snapshot.WorkerCount)
+        {
+            return CreateResult(
+                snapshot.DesiredWorkerCount,
+                ScalingReason.None,
+                throughput,
+                isSaturated,
+                null);
+        }
+
+        _baselineWorkerCount = snapshot.WorkerCount;
+        _baselineThroughput = _smoothedThroughput;
+
+        var scaleUpStep = _baselineThroughput > 0
+            ? Math.Max(1, snapshot.WorkerCount / 4)
+            : 1;
+        var requestedTarget = (long)snapshot.WorkerCount + scaleUpStep;
+        var target = Math.Min(requestedTarget, _maximumWorkerCount);
+        target = Math.Min(target, runnableParallelism);
+
+        if (target <= snapshot.WorkerCount)
+        {
+            return CreateResult(
+                snapshot.DesiredWorkerCount,
+                ScalingReason.None,
+                throughput,
+                isSaturated,
+                null);
+        }
+
+        _probeTargetWorkerCount = (int)target;
+        _warmupSamplesRemaining = _probeWarmupSamples;
+        _state = ScalingState.ProbeConvergence;
+        ResetIdlePeriod();
+
+        return CreateResult(
+            _probeTargetWorkerCount,
+            ScalingReason.ProbeUp,
+            throughput,
+            isSaturated,
+            null);
+    }
+
+    private ScalingResult ObserveProbeConvergence(
+        ScalingSnapshot snapshot,
+        double throughput,
+        bool isSaturated)
+    {
+        if (HasConverged(snapshot, _probeTargetWorkerCount))
+        {
+            _warmupSamplesRemaining = _probeWarmupSamples;
+            _state = _warmupSamplesRemaining == 0
+                ? ScalingState.ProbeMeasure
+                : ScalingState.ProbeWarmup;
+        }
+
+        return CreateResult(
+            _probeTargetWorkerCount,
+            ScalingReason.None,
+            throughput,
+            isSaturated,
+            null);
+    }
+
+    private ScalingResult ObserveProbeWarmup(
+        ScalingSnapshot snapshot,
+        double throughput,
+        bool isSaturated)
+    {
+        if (!HasConverged(snapshot, _probeTargetWorkerCount))
+        {
+            _warmupSamplesRemaining = _probeWarmupSamples;
+            _state = ScalingState.ProbeConvergence;
+        }
+        else if (--_warmupSamplesRemaining == 0)
+        {
+            _state = ScalingState.ProbeMeasure;
+        }
+
+        return CreateResult(
+            _probeTargetWorkerCount,
+            ScalingReason.None,
+            throughput,
+            isSaturated,
+            null);
+    }
+
+    private ScalingResult ObserveProbeMeasure(
+        ScalingSnapshot snapshot,
+        double throughput,
+        bool isSaturated)
+    {
+        if (!HasConverged(snapshot, _probeTargetWorkerCount))
+        {
+            _warmupSamplesRemaining = _probeWarmupSamples;
+            _state = ScalingState.ProbeConvergence;
+
+            return CreateResult(
+                _probeTargetWorkerCount,
+                ScalingReason.None,
+                throughput,
+                isSaturated,
+                null);
+        }
+
+        if (GetRunnableParallelism(snapshot) < _probeTargetWorkerCount)
+        {
+            return RejectProbe(throughput, isSaturated, null);
+        }
+
+        if (_baselineThroughput <= 0)
+        {
+            if (_smoothedThroughput > 0)
+            {
+                return AcceptProbe(throughput, isSaturated, null);
             }
 
-            break;
+            return RejectProbe(throughput, isSaturated, null);
         }
 
-        if (_nonZeroUtilizationSampleCount == 0)
+        var gain = (_smoothedThroughput - _baselineThroughput) / _baselineThroughput;
+        return gain >= _minimumUsefulThroughputGain
+            ? AcceptProbe(throughput, isSaturated, gain)
+            : RejectProbe(throughput, isSaturated, gain);
+    }
+
+    private ScalingResult ObserveRollbackConvergence(
+        ScalingSnapshot snapshot,
+        double throughput,
+        bool isSaturated)
+    {
+        if (HasConverged(snapshot, _baselineWorkerCount))
         {
-            _weightedUtilization = 0;
+            _state = ScalingState.Stable;
+            _hasCooldownStart = true;
+            _cooldownStartTimestamp = snapshot.Timestamp;
+            ResetIdlePeriod();
+            StartIdlePeriodIfEligible(snapshot);
         }
 
-        if (_saturatedSampleCount == 0)
+        return CreateResult(
+            _baselineWorkerCount,
+            ScalingReason.None,
+            throughput,
+            isSaturated,
+            null);
+    }
+
+    private ScalingResult ObserveScaleDownConvergence(
+        ScalingSnapshot snapshot,
+        double throughput,
+        bool isSaturated)
+    {
+        if (HasConverged(snapshot, _scaleDownTargetWorkerCount))
         {
-            _weightedSaturation = 0;
+            _state = ScalingState.Stable;
+            ResetIdlePeriod();
+            StartIdlePeriodIfEligible(snapshot);
         }
 
-        if (_samples.Count == 0)
+        return CreateResult(
+            _scaleDownTargetWorkerCount,
+            ScalingReason.None,
+            throughput,
+            isSaturated,
+            null);
+    }
+
+    private ScalingResult AcceptProbe(
+        double throughput,
+        bool isSaturated,
+        double? gain)
+    {
+        _baselineWorkerCount = _probeTargetWorkerCount;
+        _baselineThroughput = _smoothedThroughput;
+        _state = ScalingState.Stable;
+        ResetIdlePeriod();
+
+        return CreateResult(
+            _probeTargetWorkerCount,
+            ScalingReason.ProbeAccepted,
+            throughput,
+            isSaturated,
+            gain);
+    }
+
+    private ScalingResult RejectProbe(
+        double throughput,
+        bool isSaturated,
+        double? gain)
+    {
+        _state = ScalingState.RollbackConvergence;
+        ResetIdlePeriod();
+
+        return CreateResult(
+            _baselineWorkerCount,
+            ScalingReason.ProbeRejected,
+            throughput,
+            isSaturated,
+            gain);
+    }
+
+    private ScalingResult CreateResult(
+        int desiredWorkerCount,
+        ScalingReason reason,
+        double throughput,
+        bool isSaturated,
+        double? probeGain)
+    {
+        return new ScalingResult(
+            desiredWorkerCount,
+            reason,
+            throughput,
+            _hasSmoothedThroughput ? _smoothedThroughput : 0,
+            isSaturated,
+            probeGain);
+    }
+
+    private void RebaselineSample(ScalingSnapshot snapshot)
+    {
+        _hasSampleBaseline = true;
+        _lastCompletedMessages = snapshot.CompletedMessages;
+        _lastTimestamp = snapshot.Timestamp;
+    }
+
+    private void UpdateSmoothedThroughput(double throughput)
+    {
+        if (!_hasSmoothedThroughput)
         {
-            _coveredTimestampTicks = 0;
-            _trimmedHeadStartTimestamp = NoTimestamp;
+            _smoothedThroughput = throughput;
+            _hasSmoothedThroughput = true;
+            return;
+        }
+
+        _smoothedThroughput =
+            (_throughputSmoothingFactor * throughput) +
+            ((1 - _throughputSmoothingFactor) * _smoothedThroughput);
+    }
+
+    private int GetDesiredWorkerCount(ScalingSnapshot snapshot)
+    {
+        return _state switch
+        {
+            ScalingState.ProbeConvergence or
+            ScalingState.ProbeWarmup or
+            ScalingState.ProbeMeasure => _probeTargetWorkerCount,
+            ScalingState.RollbackConvergence => _baselineWorkerCount,
+            ScalingState.ScaleDownConvergence => _scaleDownTargetWorkerCount,
+            _ => snapshot.DesiredWorkerCount
+        };
+    }
+
+    private bool IsProbeActive()
+    {
+        return _state is ScalingState.ProbeConvergence or
+            ScalingState.ProbeWarmup or
+            ScalingState.ProbeMeasure;
+    }
+
+    private bool IsScaleUpCooldownElapsed(long timestamp)
+    {
+        return !_hasCooldownStart ||
+            HasElapsed(_cooldownStartTimestamp, timestamp, _scaleUpCooldown);
+    }
+
+    private bool IsIdleScaleDownEligible(ScalingSnapshot snapshot)
+    {
+        return snapshot.RunnableWorkItemCount == 0 &&
+            snapshot.BusyWorkers < snapshot.DesiredWorkerCount &&
+            snapshot.WorkerCount == snapshot.DesiredWorkerCount &&
+            snapshot.DesiredWorkerCount > _minimumWorkerCount;
+    }
+
+    private void StartIdlePeriodIfEligible(ScalingSnapshot snapshot)
+    {
+        if (IsIdleScaleDownEligible(snapshot))
+        {
+            _hasIdleStart = true;
+            _idleStartTimestamp = snapshot.Timestamp;
         }
     }
 
-    private void RemoveDuration(TimedSample sample, long duration)
+    private void ResetIdlePeriod()
     {
-        _coveredTimestampTicks -= duration;
-        _weightedUtilization -= duration * sample.Utilization;
-        _weightedSaturation -= duration * sample.Saturation;
+        _hasIdleStart = false;
     }
 
-    private void RecordLatestSample(long timestamp, double utilization, bool saturated)
+    private static bool HasConverged(ScalingSnapshot snapshot, int targetWorkerCount)
     {
-        _lastSampleTimestamp = timestamp;
-        _lastUtilization = utilization;
-        _lastSaturation = saturated ? 1d : 0d;
+        return snapshot.WorkerCount == targetWorkerCount &&
+            snapshot.DesiredWorkerCount == targetWorkerCount;
     }
 
-    private bool IsCooldownElapsed(long timestamp, TimeSpan cooldown)
+    private static bool IsSaturated(ScalingSnapshot snapshot)
     {
-        return _lastScaleChangeTimestamp == NoTimestamp ||
-            Stopwatch.GetElapsedTime(_lastScaleChangeTimestamp, timestamp) >= cooldown;
+        return snapshot.WorkerCount > 0 &&
+            snapshot.BusyWorkers >= snapshot.WorkerCount &&
+            snapshot.RunnableWorkItemCount > 0;
     }
 
-    private void ResetSamples()
+    private static long GetRunnableParallelism(ScalingSnapshot snapshot)
     {
-        _samples.Clear();
-        _weightedUtilization = 0;
-        _weightedSaturation = 0;
-        _coveredTimestampTicks = 0;
-        _nonZeroUtilizationSampleCount = 0;
-        _saturatedSampleCount = 0;
-        _trimmedHeadStartTimestamp = NoTimestamp;
-        _lastSampleTimestamp = NoTimestamp;
-        _lastUtilization = 0;
-        _lastSaturation = 0;
+        if (snapshot.BusyWorkers > 0 &&
+            snapshot.RunnableWorkItemCount > long.MaxValue - snapshot.BusyWorkers)
+        {
+            return long.MaxValue;
+        }
+
+        if (snapshot.BusyWorkers < 0 &&
+            snapshot.RunnableWorkItemCount < long.MinValue - snapshot.BusyWorkers)
+        {
+            return long.MinValue;
+        }
+
+        return snapshot.RunnableWorkItemCount + snapshot.BusyWorkers;
+    }
+
+    private static bool HasElapsed(long startTimestamp, long timestamp, TimeSpan duration)
+    {
+        return timestamp >= startTimestamp &&
+            Stopwatch.GetElapsedTime(startTimestamp, timestamp) >= duration;
     }
 }
