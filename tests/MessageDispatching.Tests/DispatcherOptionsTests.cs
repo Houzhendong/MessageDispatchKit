@@ -18,6 +18,8 @@ public sealed class DispatcherOptionsTests
         Assert.Equal(0.02, options.DynamicScaling.MinimumUsefulThroughputGain);
         Assert.Equal(0.25, options.DynamicScaling.ThroughputSmoothingFactor);
         Assert.Equal(1, options.DynamicScaling.ProbeWarmupSamples);
+        Assert.Equal(3, options.DynamicScaling.ThroughputMeasurementSamples);
+        Assert.Equal(TimeSpan.FromSeconds(10), options.DynamicScaling.ProbeTimeout);
         Assert.Equal(TimeSpan.FromSeconds(2), options.DynamicScaling.ScaleUpCooldown);
         Assert.Equal(TimeSpan.FromSeconds(5), options.DynamicScaling.ScaleDownIdleDuration);
         options.Validate();
@@ -137,6 +139,34 @@ public sealed class DispatcherOptionsTests
             });
 
         AssertParameter(nameof(DynamicScalingOptions.ProbeWarmupSamples), options);
+    }
+
+    [Theory]
+    [InlineData(0)]
+    [InlineData(-1)]
+    public void ThroughputMeasurementSamplesMustBePositive(int value)
+    {
+        var options = OptionsWithScaling(
+            new DynamicScalingOptions
+            {
+                ThroughputMeasurementSamples = value
+            });
+
+        AssertParameter(nameof(DynamicScalingOptions.ThroughputMeasurementSamples), options);
+    }
+
+    [Theory]
+    [InlineData(0)]
+    [InlineData(-1)]
+    public void ProbeTimeoutMustBePositive(long ticks)
+    {
+        var options = OptionsWithScaling(
+            new DynamicScalingOptions
+            {
+                ProbeTimeout = TimeSpan.FromTicks(ticks)
+            });
+
+        AssertParameter(nameof(DynamicScalingOptions.ProbeTimeout), options);
     }
 
     [Fact]
