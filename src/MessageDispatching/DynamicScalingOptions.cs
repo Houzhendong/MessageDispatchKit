@@ -13,6 +13,11 @@ public sealed class DynamicScalingOptions
 
     public int ProbeWarmupSamples { get; init; } = 1;
 
+    public int ThroughputMeasurementSamples { get; init; } = 3;
+
+    // Includes convergence and warmup; restarting a measurement window does not extend the deadline.
+    public TimeSpan ProbeTimeout { get; init; } = TimeSpan.FromSeconds(10);
+
     public TimeSpan ScaleUpCooldown { get; init; } = TimeSpan.FromSeconds(2);
 
     public TimeSpan ScaleDownIdleDuration { get; init; } = TimeSpan.FromSeconds(5);
@@ -47,6 +52,20 @@ public sealed class DynamicScalingOptions
             throw new ArgumentOutOfRangeException(
                 nameof(ProbeWarmupSamples),
                 "ProbeWarmupSamples must be zero or greater.");
+        }
+
+        if (ThroughputMeasurementSamples <= 0)
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(ThroughputMeasurementSamples),
+                "ThroughputMeasurementSamples must be greater than zero.");
+        }
+
+        if (ProbeTimeout <= TimeSpan.Zero)
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(ProbeTimeout),
+                "ProbeTimeout must be greater than zero.");
         }
 
         if (ScaleUpCooldown < TimeSpan.Zero)

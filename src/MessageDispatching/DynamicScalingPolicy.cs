@@ -44,6 +44,9 @@ internal sealed class DynamicScalingPolicy
     private readonly double _minimumUsefulThroughputGain;
     private readonly double _throughputSmoothingFactor;
     private readonly int _probeWarmupSamples;
+    private readonly int _throughputMeasurementSamples;
+    private readonly TimeSpan _probeTimeout;
+    private readonly Queue<ScalingSnapshot> _throughputWindow = new();
     private readonly TimeSpan _scaleUpCooldown;
     private readonly TimeSpan _scaleDownIdleDuration;
 
@@ -56,10 +59,11 @@ internal sealed class DynamicScalingPolicy
 
     private int _baselineWorkerCount;
     private double _baselineThroughput;
-    private int _nextProbeStep = 1;
+    private int? _nextProbeStep;
     private int _activeProbeStep;
     private int _probeTargetWorkerCount;
     private int _warmupSamplesRemaining;
+    private long _probeStartTimestamp;
 
     private int _scaleDownTargetWorkerCount;
     private bool _hasIdleStart;
@@ -77,13 +81,15 @@ internal sealed class DynamicScalingPolicy
         _minimumUsefulThroughputGain = options.DynamicScaling.MinimumUsefulThroughputGain;
         _throughputSmoothingFactor = options.DynamicScaling.ThroughputSmoothingFactor;
         _probeWarmupSamples = options.DynamicScaling.ProbeWarmupSamples;
+        _throughputMeasurementSamples = options.DynamicScaling.ThroughputMeasurementSamples;
+        _probeTimeout = options.DynamicScaling.ProbeTimeout;
         _scaleUpCooldown = options.DynamicScaling.ScaleUpCooldown;
         _scaleDownIdleDuration = options.DynamicScaling.ScaleDownIdleDuration;
     }
 
     internal ScalingState State => _state;
 
-    internal int NextProbeStep => _nextProbeStep;
+    internal int? NextProbeStep => _nextProbeStep;
 
     internal int ActiveProbeStep => _activeProbeStep;
 
@@ -94,6 +100,7 @@ internal sealed class DynamicScalingPolicy
         if (!_hasSampleBaseline)
         {
             RebaselineSample(snapshot);
+            ObserveThroughputWindow(snapshot);
             StartIdlePeriodIfEligible(snapshot);
             return CreateResult(
                 snapshot.DesiredWorkerCount,
@@ -107,6 +114,7 @@ internal sealed class DynamicScalingPolicy
             snapshot.CompletedMessages < _lastCompletedMessages)
         {
             RebaselineSample(snapshot);
+            _throughputWindow.Clear();
             ResetIdlePeriod();
 
             if (IsProbeActive())
@@ -123,12 +131,17 @@ internal sealed class DynamicScalingPolicy
         }
 
         var elapsedSeconds = Stopwatch.GetElapsedTime(_lastTimestamp, snapshot.Timestamp).TotalSeconds;
-        var completedDelta = (double)snapshot.CompletedMessages - _lastCompletedMessages;
+        var completedDelta = snapshot.CompletedMessages - _lastCompletedMessages;
         var throughput = completedDelta / elapsedSeconds;
 
         _lastTimestamp = snapshot.Timestamp;
         _lastCompletedMessages = snapshot.CompletedMessages;
         UpdateSmoothedThroughput(throughput);
+
+        if (IsProbeActive() && HasElapsed(_probeStartTimestamp, snapshot.Timestamp, _probeTimeout))
+        {
+            return RejectProbe(throughput, isSaturated, null);
+        }
 
         return _state switch
         {
@@ -153,6 +166,8 @@ internal sealed class DynamicScalingPolicy
         double throughput,
         bool isSaturated)
     {
+        var baselineThroughput = ObserveThroughputWindow(snapshot);
+
         if (snapshot.WorkerCount != snapshot.DesiredWorkerCount)
         {
             ResetIdlePeriod();
@@ -174,7 +189,8 @@ internal sealed class DynamicScalingPolicy
             else if (HasElapsed(_idleStartTimestamp, snapshot.Timestamp, _scaleDownIdleDuration))
             {
                 _scaleDownTargetWorkerCount = snapshot.DesiredWorkerCount - 1;
-                _nextProbeStep = 1;
+                _nextProbeStep = null;
+                _throughputWindow.Clear();
                 _state = ScalingState.ScaleDownConvergence;
                 ResetIdlePeriod();
 
@@ -191,7 +207,7 @@ internal sealed class DynamicScalingPolicy
             ResetIdlePeriod();
         }
 
-        if (!isSaturated || !_hasSmoothedThroughput)
+        if (!isSaturated || !baselineThroughput.HasValue)
         {
             return CreateResult(
                 snapshot.DesiredWorkerCount,
@@ -226,10 +242,12 @@ internal sealed class DynamicScalingPolicy
         }
 
         _baselineWorkerCount = snapshot.WorkerCount;
-        _baselineThroughput = _smoothedThroughput;
+        _baselineThroughput = baselineThroughput.Value;
 
         var requestedStep = _baselineThroughput > 0
-            ? _nextProbeStep
+            ? _nextProbeStep.HasValue
+                ? Math.Max(_nextProbeStep.Value, GetThroughputProbeStep(snapshot.WorkerCount, 1))
+                : GetThroughputProbeStep(snapshot.WorkerCount, 2)
             : 1;
         var proportionalStepCap = snapshot.WorkerCount <= 2
             ? snapshot.WorkerCount
@@ -255,6 +273,8 @@ internal sealed class DynamicScalingPolicy
         _activeProbeStep = (int)actualStep;
         _probeTargetWorkerCount = snapshot.WorkerCount + _activeProbeStep;
         _warmupSamplesRemaining = _probeWarmupSamples;
+        _probeStartTimestamp = snapshot.Timestamp;
+        _throughputWindow.Clear();
         _state = ScalingState.ProbeConvergence;
         ResetIdlePeriod();
 
@@ -277,6 +297,10 @@ internal sealed class DynamicScalingPolicy
             _state = _warmupSamplesRemaining == 0
                 ? ScalingState.ProbeMeasure
                 : ScalingState.ProbeWarmup;
+            if (_state == ScalingState.ProbeMeasure)
+            {
+                ObserveThroughputWindow(snapshot);
+            }
         }
 
         return CreateResult(
@@ -295,11 +319,13 @@ internal sealed class DynamicScalingPolicy
         if (!HasConverged(snapshot, _probeTargetWorkerCount))
         {
             _warmupSamplesRemaining = _probeWarmupSamples;
+            _throughputWindow.Clear();
             _state = ScalingState.ProbeConvergence;
         }
         else if (--_warmupSamplesRemaining == 0)
         {
             _state = ScalingState.ProbeMeasure;
+            ObserveThroughputWindow(snapshot);
         }
 
         return CreateResult(
@@ -318,6 +344,7 @@ internal sealed class DynamicScalingPolicy
         if (!HasConverged(snapshot, _probeTargetWorkerCount))
         {
             _warmupSamplesRemaining = _probeWarmupSamples;
+            _throughputWindow.Clear();
             _state = ScalingState.ProbeConvergence;
 
             return CreateResult(
@@ -333,19 +360,27 @@ internal sealed class DynamicScalingPolicy
             return RejectProbe(throughput, isSaturated, null);
         }
 
-        if (_baselineThroughput <= 0)
+        var probeThroughput = ObserveThroughputWindow(snapshot);
+        if (!probeThroughput.HasValue)
         {
-            if (_smoothedThroughput > 0)
-            {
-                return AcceptProbe(throughput, isSaturated, null);
-            }
-
-            return RejectProbe(throughput, isSaturated, null);
+            return CreateResult(
+                _probeTargetWorkerCount,
+                ScalingReason.None,
+                throughput,
+                isSaturated,
+                null);
         }
 
-        var gain = (_smoothedThroughput - _baselineThroughput) / _baselineThroughput;
+        if (_baselineThroughput <= 0)
+        {
+            return probeThroughput.Value > 0
+                ? AcceptProbe(throughput, isSaturated, probeThroughput.Value, null)
+                : RejectProbe(throughput, isSaturated, null);
+        }
+
+        var gain = (probeThroughput.Value - _baselineThroughput) / _baselineThroughput;
         return gain >= _minimumUsefulThroughputGain
-            ? AcceptProbe(throughput, isSaturated, gain)
+            ? AcceptProbe(throughput, isSaturated, probeThroughput.Value, gain)
             : RejectProbe(throughput, isSaturated, gain);
     }
 
@@ -360,6 +395,7 @@ internal sealed class DynamicScalingPolicy
             _hasCooldownStart = true;
             _cooldownStartTimestamp = snapshot.Timestamp;
             ResetIdlePeriod();
+            ObserveThroughputWindow(snapshot);
             StartIdlePeriodIfEligible(snapshot);
         }
 
@@ -380,6 +416,7 @@ internal sealed class DynamicScalingPolicy
         {
             _state = ScalingState.Stable;
             ResetIdlePeriod();
+            ObserveThroughputWindow(snapshot);
             StartIdlePeriodIfEligible(snapshot);
         }
 
@@ -394,6 +431,7 @@ internal sealed class DynamicScalingPolicy
     private ScalingResult AcceptProbe(
         double throughput,
         bool isSaturated,
+        double probeThroughput,
         double? gain)
     {
         if (_baselineThroughput > 0 && gain.HasValue)
@@ -419,11 +457,11 @@ internal sealed class DynamicScalingPolicy
         }
         else
         {
-            _nextProbeStep = 1;
+            _nextProbeStep = null;
         }
 
         _baselineWorkerCount = _probeTargetWorkerCount;
-        _baselineThroughput = _smoothedThroughput;
+        _baselineThroughput = probeThroughput;
         _state = ScalingState.Stable;
         ResetIdlePeriod();
 
@@ -444,7 +482,8 @@ internal sealed class DynamicScalingPolicy
             double.IsFinite(gain.Value) &&
             gain.Value >= 0
                 ? Math.Max(1, _activeProbeStep / 2)
-                : 1;
+                : null;
+        _throughputWindow.Clear();
         _state = ScalingState.RollbackConvergence;
         ResetIdlePeriod();
 
@@ -477,6 +516,46 @@ internal sealed class DynamicScalingPolicy
         _hasSampleBaseline = true;
         _lastCompletedMessages = snapshot.CompletedMessages;
         _lastTimestamp = snapshot.Timestamp;
+    }
+
+    private double? ObserveThroughputWindow(ScalingSnapshot snapshot)
+    {
+        // At the key limit every worker can be busy without any additional ready keys.
+        if (snapshot.WorkerCount <= 0 ||
+            snapshot.WorkerCount != snapshot.DesiredWorkerCount ||
+            snapshot.BusyWorkers < snapshot.WorkerCount)
+        {
+            _throughputWindow.Clear();
+            return null;
+        }
+
+        if (_throughputWindow.Count > 0 &&
+            _throughputWindow.Peek().WorkerCount != snapshot.WorkerCount)
+        {
+            _throughputWindow.Clear();
+        }
+
+        // Keep both endpoints of each interval; an isolated saturated sample is not a baseline.
+        if (_throughputWindow.Count > _throughputMeasurementSamples)
+        {
+            _throughputWindow.Dequeue();
+        }
+
+        _throughputWindow.Enqueue(snapshot);
+        if (_throughputWindow.Count <= _throughputMeasurementSamples)
+        {
+            return null;
+        }
+
+        var start = _throughputWindow.Peek();
+        return (snapshot.CompletedMessages - start.CompletedMessages) /
+            Stopwatch.GetElapsedTime(start.Timestamp, snapshot.Timestamp).TotalSeconds;
+    }
+
+    private int GetThroughputProbeStep(int workerCount, int gainMultiplier)
+    {
+        var step = Math.Ceiling(workerCount * _minimumUsefulThroughputGain * gainMultiplier);
+        return (int)Math.Clamp(step, 1, int.MaxValue);
     }
 
     private void UpdateSmoothedThroughput(double throughput)
