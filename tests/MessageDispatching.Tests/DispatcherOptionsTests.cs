@@ -75,6 +75,44 @@ public sealed class DispatcherOptionsTests
         AssertParameter(nameof(DynamicScalingOptions.SampleInterval), options);
     }
 
+    [Fact]
+    public void SubMillisecondSampleIntervalIsRejectedBeforeStartingWorkers()
+    {
+        AssertParameter(nameof(DynamicScalingOptions.SampleInterval),
+            OptionsWithScaling(new DynamicScalingOptions { SampleInterval = TimeSpan.FromTicks(1) }));
+    }
+
+    [Theory]
+    [InlineData(0)]
+    [InlineData(-1)]
+    [InlineData(1.1)]
+    [InlineData(double.NaN)]
+    [InlineData(double.PositiveInfinity)]
+    public void LoadMatchingFractionsAreValidated(double value)
+    {
+        AssertParameter(nameof(DynamicScalingOptions.TargetUtilization),
+            OptionsWithScaling(new DynamicScalingOptions { TargetUtilization = value }));
+        AssertParameter(nameof(DynamicScalingOptions.CpuUtilizationLimit),
+            OptionsWithScaling(new DynamicScalingOptions { CpuUtilizationLimit = value }));
+    }
+
+    [Fact]
+    public void LoadMatchingBudgetsAndWindowsAreValidated()
+    {
+        AssertParameter(nameof(DynamicScalingOptions.ResourceParallelismLimit),
+            OptionsWithScaling(new DynamicScalingOptions { ResourceParallelismLimit = -1 }));
+        AssertParameter(nameof(DynamicScalingOptions.UtilizationWindow),
+            OptionsWithScaling(new DynamicScalingOptions { UtilizationWindow = TimeSpan.Zero }));
+        AssertParameter(nameof(DynamicScalingOptions.TargetQueueWait),
+            OptionsWithScaling(new DynamicScalingOptions { TargetQueueWait = TimeSpan.Zero }));
+        AssertParameter(nameof(DynamicScalingOptions.ScaleUpInterval),
+            OptionsWithScaling(new DynamicScalingOptions { ScaleUpInterval = TimeSpan.FromTicks(-1) }));
+        AssertParameter(nameof(DynamicScalingOptions.CapacityMeasurementWindow),
+            OptionsWithScaling(new DynamicScalingOptions { CapacityMeasurementWindow = TimeSpan.Zero }));
+        AssertParameter(nameof(DynamicScalingOptions.CapacityRetryInterval),
+            OptionsWithScaling(new DynamicScalingOptions { CapacityRetryInterval = TimeSpan.Zero }));
+    }
+
     [Theory]
     [InlineData(double.NaN)]
     [InlineData(double.NegativeInfinity)]

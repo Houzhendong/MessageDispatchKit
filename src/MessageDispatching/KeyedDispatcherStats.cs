@@ -16,4 +16,11 @@ public readonly record struct KeyedDispatcherStats(
     long ProbeAcceptCount,
     long ProbeRejectCount,
     double? LastProbeGain,
-    bool Accepting);
+    bool Accepting)
+{
+    public int ActiveKeyCount { get; init; }
+    public double AverageBusyWorkers { get; init; }
+    public double ReadyKeyWaitMilliseconds { get; init; }
+    public int CapacityLimit { get; init; }
+    public double ProcessCpuUtilization { get; init; }
+}

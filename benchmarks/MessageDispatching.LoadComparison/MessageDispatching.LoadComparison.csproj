@@ -1,0 +1,15 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <DispatcherAssemblyPath Condition="'$(DispatcherAssemblyPath)' == ''">$(MSBuildThisFileDirectory)../../src/MessageDispatching/bin/Release/net8.0/MessageDispatching.dll</DispatcherAssemblyPath>
+  </PropertyGroup>
+  <!-- Compile the identical harness against either version, in separate processes. -->
+  <ItemGroup>
+    <Reference Include="MessageDispatching">
+      <HintPath>$(DispatcherAssemblyPath)</HintPath>
+    </Reference>
+  </ItemGroup>
+</Project>

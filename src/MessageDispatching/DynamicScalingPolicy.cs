@@ -24,7 +24,10 @@ internal enum ScalingReason
     ProbeUp,
     ProbeAccepted,
     ProbeRejected,
-    IdleScaleDown
+    IdleScaleDown,
+    LoadScaleUp,
+    LoadScaleDown,
+    CapacityLimited
 }
 
 internal enum ScalingState
