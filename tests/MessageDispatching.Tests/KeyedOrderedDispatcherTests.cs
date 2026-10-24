@@ -328,6 +328,70 @@ public sealed class KeyedOrderedDispatcherTests
         Assert.Equal(1, dispatcher.GetStats().CompletedMessages);
     }
 
+    [Fact]
+    public async Task BusyTimeIncludesHandlersThatHaveNotCompletedAnyMessages()
+    {
+        using var handler = new GatedKeyedHandler();
+        await using var dispatcher = new KeyedOrderedDispatcher<string, int>(CreateDynamicOptions(1, 2));
+        dispatcher.Start(handler);
+        try
+        {
+            dispatcher.Enqueue("hot", 0);
+            await TestWait.UntilAsync(() => dispatcher.GetStats().AverageBusyWorkers > 0.8);
+            var hot = dispatcher.GetStats();
+            Assert.Equal(0, hot.CompletedMessages);
+            Assert.Equal(1, hot.ActiveKeyCount);
+            dispatcher.Enqueue("cold", 0);
+            await TestWait.UntilAsync(() => handler.ColdStarted);
+            Assert.Equal(2, dispatcher.GetStats().ActiveKeyCount);
+            Assert.Equal(0, dispatcher.GetStats().CompletedMessages);
+        }
+        finally
+        {
+            handler.ReleaseAll();
+            await dispatcher.CompleteAsync();
+        }
+        Assert.Equal(0, dispatcher.GetStats().ActiveKeyCount);
+    }
+
+    [Fact]
+    public async Task SameKeyOrderingSurvivesDynamicGrowthAndRetirement()
+    {
+        var handler = new OrderedLoadHandler();
+        await using var dispatcher = new KeyedOrderedDispatcher<int, int>(CreateDynamicOptions(1, 8));
+        dispatcher.Start(handler);
+        for (var sequence = 0; sequence < 80; sequence++)
+        {
+            for (var key = 0; key < 8; key++) dispatcher.Enqueue(key, sequence);
+        }
+        await TestWait.UntilAsync(() => dispatcher.GetStats().WorkerCount > 1);
+        await TestWait.UntilAsync(() => dispatcher.GetStats().PendingMessages == 0);
+        await TestWait.UntilAsync(() => dispatcher.GetStats().WorkerCount == 1);
+        await dispatcher.CompleteAsync();
+        Assert.Equal(0, handler.Violations);
+        Assert.Equal(640, dispatcher.GetStats().CompletedMessages);
+        Assert.Equal(0, dispatcher.GetStats().ActiveKeyCount);
+        Assert.True(dispatcher.GetStats().ScaleDownCount > 0);
+    }
+
+    private sealed class OrderedLoadHandler : IKeyedMessageHandler<int, int>
+    {
+        private readonly int[] _active = new int[8];
+        private readonly int[] _next = new int[8];
+        private int _violations;
+        public int Violations => Volatile.Read(ref _violations);
+        public void Handle(int key, int message, CancellationToken cancellationToken)
+        {
+            if (Interlocked.Increment(ref _active[key]) != 1) Interlocked.Increment(ref _violations);
+            try
+            {
+                if (_next[key]++ != message) Interlocked.Increment(ref _violations);
+                Thread.Sleep(2);
+            }
+            finally { Interlocked.Decrement(ref _active[key]); }
+        }
+    }
+
     private static DispatcherOptions CreateDynamicOptions(
         int parallelism,
         int maxParallelism,
@@ -341,6 +405,9 @@ public sealed class KeyedOrderedDispatcherTests
             DynamicScaling = new DynamicScalingOptions
             {
                 SampleInterval = TimeSpan.FromMilliseconds(20),
+                ResourceParallelismLimit = maxParallelism,
+                UtilizationWindow = TimeSpan.FromMilliseconds(40),
+                ScaleUpInterval = TimeSpan.FromMilliseconds(20),
                 MinimumUsefulThroughputGain = 0,
                 ThroughputSmoothingFactor = 1,
                 ProbeWarmupSamples = 0,

@@ -1,0 +1,17 @@
+{
+  "Baseline": "9d1663ce2d58191ea6cd4a9d56cfda82ba8266ff",
+  "Branch": "feature/load-matched-scaling",
+  "DateUtc": "2026-10-24T08:16:21.6372963Z",
+  "Repeats": 3,
+  "DurationSeconds": 12,
+  "WorkPasses": 66,
+  "CalibratedCapacityPerSecond": 2418.8507772305848,
+  "LogicalProcessors": 20,
+  "Runtime": "Microsoft.AspNetCore.App 8.0.32 [C:\\Program Files\\dotnet\\shared\\Microsoft.AspNetCore.App]\nMicrosoft.AspNetCore.App 9.0.21 [C:\\Program Files\\dotnet\\shared\\Microsoft.AspNetCore.App]\nMicrosoft.AspNetCore.App 10.0.13 [C:\\Program Files\\dotnet\\shared\\Microsoft.AspNetCore.App]\nMicrosoft.NETCore.App 8.0.12 [C:\\Program Files\\dotnet\\shared\\Microsoft.NETCore.App]\nMicrosoft.NETCore.App 8.0.32 [C:\\Program Files\\dotnet\\shared\\Microsoft.NETCore.App]\nMicrosoft.NETCore.App 9.0.21 [C:\\Program Files\\dotnet\\shared\\Microsoft.NETCore.App]\nMicrosoft.NETCore.App 10.0.13 [C:\\Program Files\\dotnet\\shared\\Microsoft.NETCore.App]\nMicrosoft.WindowsDesktop.App 8.0.12 [C:\\Program Files\\dotnet\\shared\\Microsoft.WindowsDesktop.App]\nMicrosoft.WindowsDesktop.App 8.0.32 [C:\\Program Files\\dotnet\\shared\\Microsoft.WindowsDesktop.App]\nMicrosoft.WindowsDesktop.App 9.0.21 [C:\\Program Files\\dotnet\\shared\\Microsoft.WindowsDesktop.App]\nMicrosoft.WindowsDesktop.App 10.0.13 [C:\\Program Files\\dotnet\\shared\\Microsoft.WindowsDesktop.App]",
+  "SampleMilliseconds": 100,
+  "ScaleDownSeconds": 1,
+  "TargetUtilization": 0.8,
+  "OldAssemblySha256": "F7B01AF5251F82041CA5D4467D4984E6DA276FBB9DBE4776C462D0E3D79CDC50",
+  "NewAssemblySha256": "6A4F801E24923A46F68DDA5254EB48E2BE5C46C0CE29642D59F7A7FDDE17B9C3",
+  "HarnessSha256": "CB9120181B27CAC8CF6DE9D179A37040DF603790AAAF3851F3C3E571A6589954"
+}

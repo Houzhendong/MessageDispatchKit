@@ -7,7 +7,7 @@
 - `KeyedOrderedDispatcher<TKey, TMessage>`：同一个 key 严格顺序执行，不同 key 可并行。
 - `MessageDispatcher<TInput, TOutput>`：无 key 的并行转换与订阅发布，不提供消息间顺序保证。
 
-典型 workload 是解压、protobuf / MessagePack 反序列化和少量 CPU 处理。动态并行度使用吞吐量探测式 hill climbing，而不是根据消息积压直接计算 worker 数。
+典型 workload 是解压、protobuf / MessagePack 反序列化和少量 CPU 处理。keyed dispatcher 使用目标利用率、就绪 key 等待和资源预算匹配负载；普通 dispatcher 使用吞吐量探测式 hill climbing。
 
 ## 代码结构
 
@@ -20,6 +20,7 @@ src/MessageDispatching/
   DispatcherScalingStats.cs
   DispatcherScaleChange.cs
   DynamicScalingPolicy.cs
+  LoadMatchingScalingPolicy.cs
   KeyedOrderedDispatcher.cs
   MessageDispatcher.cs
 
@@ -120,6 +121,10 @@ await dispatcher.CompleteAsync(ct);
 普通 dispatcher 的吞吐量包含 transformer 和同步 subscriber fan-out 的总耗时，因为它们共同占用 worker。
 
 ## 动态扩缩容
+
+keyed dispatcher 的当前算法、配置和指标见 [负载匹配扩缩容](docs/load-matching-scaling.md)，
+新旧版本的实测见 [对比程序](benchmarks/MessageDispatching.LoadComparison/README.md)。
+下面的吞吐 probe 状态机仍用于普通 dispatcher，也是 `9d1663c` 旧 keyed 版本的对照策略。
 
 ### 启用方式
 
@@ -273,6 +278,8 @@ ReadyWorkItemCount == 0
 - `ScaleUpCount` / `ScaleDownCount`
 - `ProbeAcceptCount` / `ProbeRejectCount` / `LastProbeGain`
 - `Accepting`
+- `ActiveKeyCount` / `AverageBusyWorkers` / `ReadyKeyWaitMilliseconds`
+- `CapacityLimit` / `ProcessCpuUtilization`
 
 ### DispatcherStats
 

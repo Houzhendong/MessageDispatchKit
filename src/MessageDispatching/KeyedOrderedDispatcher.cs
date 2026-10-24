@@ -13,9 +13,39 @@ public sealed class KeyedOrderedDispatcher<TKey, TMessage> : IAsyncDisposable
         public Task WorkerTask { get; set; } = Task.CompletedTask;
         public bool IsWaiting;
         public bool RetirementRequested;
+        private readonly object _metricsLock = new();
+        private long _busyStarted;
+        private long _busyTicks;
+
+        public void BeginProcessing()
+        {
+            lock (_metricsLock)
+            {
+                _busyStarted = Stopwatch.GetTimestamp();
+            }
+        }
+
+        public void EndProcessing()
+        {
+            lock (_metricsLock)
+            {
+                _busyTicks += Stopwatch.GetTimestamp() - _busyStarted;
+                _busyStarted = 0;
+            }
+        }
+
+        public long ReadBusyTicks()
+        {
+            lock (_metricsLock)
+            {
+                return _busyTicks + (_busyStarted == 0 ? 0 : Stopwatch.GetTimestamp() - _busyStarted);
+            }
+        }
 
         public void Dispose() => RetirementCts.Dispose();
     }
+
+    private readonly record struct ReadyKey(TKey Key, long ReadyTimestamp);
 
     private sealed class KeyState
     {
@@ -62,7 +92,7 @@ public sealed class KeyedOrderedDispatcher<TKey, TMessage> : IAsyncDisposable
     // while the rare first enqueue for a new key takes the lock and publishes a rebuilt map.
     private readonly object _statesLock = new();
     private FrozenDictionary<TKey, KeyState> _states = FrozenDictionary<TKey, KeyState>.Empty;
-    private readonly Channel<TKey> _readyKeys;
+    private readonly Channel<ReadyKey> _readyKeys;
     private readonly DispatcherOptions _options;
     private readonly Action<DispatcherScaleChange>? _scaleObserver;
     private readonly CancellationTokenSource _stopCts = new();
@@ -70,7 +100,8 @@ public sealed class KeyedOrderedDispatcher<TKey, TMessage> : IAsyncDisposable
     private readonly object _lifetimeLock = new();
     private readonly object _workersLock = new();
     private readonly List<WorkerRegistration> _workers = new();
-    private readonly DynamicScalingPolicy? _scalingPolicy;
+    private readonly LoadMatchingScalingPolicy? _scalingPolicy;
+    private readonly Process? _cpuProcess;
     private Task? _scaleController;
 
     private long _pendingMessages;
@@ -83,6 +114,15 @@ public sealed class KeyedOrderedDispatcher<TKey, TMessage> : IAsyncDisposable
     private int _desiredWorkerCount;
     private int _busyWorkers;
     private int _readyKeyCount;
+    private int _activeKeyCount;
+    private long _retiredBusyTicks;
+    private long _lastBusyTicks;
+    private long _lastLoadTimestamp;
+    private TimeSpan _lastCpuTime;
+    private double _averageBusyWorkers;
+    private double _readyKeyWaitMilliseconds;
+    private double _processCpuUtilization;
+    private int _capacityLimit;
     private double _throughput;
     private double _smoothedThroughput;
     private double _lastProbeGain = double.NaN;
@@ -98,13 +138,15 @@ public sealed class KeyedOrderedDispatcher<TKey, TMessage> : IAsyncDisposable
         _options.Validate();
         _scaleObserver = _options.ScaleObserver;
         _scalingPolicy = _options.IsDynamicScalingEnabled
-            ? new DynamicScalingPolicy(_options)
+            ? new LoadMatchingScalingPolicy(_options)
             : null;
+        _capacityLimit = _scalingPolicy?.CapacityLimit ?? _options.Parallelism;
+        _cpuProcess = _options.IsDynamicScalingEnabled ? Process.GetCurrentProcess() : null;
 
         // Unbounded so ScheduleKey never fails: at most one entry per active key can be queued,
         // and messages themselves live in the per-key queues, so this adds no unbounded memory.
         // Backpressure is out of scope by design (see HANDOFF: enqueue is non-blocking).
-        _readyKeys = Channel.CreateUnbounded<TKey>(
+        _readyKeys = Channel.CreateUnbounded<ReadyKey>(
             new UnboundedChannelOptions
             {
                 SingleReader = false,
@@ -138,6 +180,8 @@ public sealed class KeyedOrderedDispatcher<TKey, TMessage> : IAsyncDisposable
             _started = true;
             Volatile.Write(ref _accepting, true);
             Volatile.Write(ref _desiredWorkerCount, _options.Parallelism);
+            _lastLoadTimestamp = Stopwatch.GetTimestamp();
+            _lastCpuTime = _cpuProcess?.TotalProcessorTime ?? TimeSpan.Zero;
 
             lock (_workersLock)
             {
@@ -177,7 +221,14 @@ public sealed class KeyedOrderedDispatcher<TKey, TMessage> : IAsyncDisposable
             Interlocked.Read(ref _probeAcceptCount),
             Interlocked.Read(ref _probeRejectCount),
             double.IsNaN(lastProbeGain) ? null : lastProbeGain,
-            Volatile.Read(ref _accepting) && !Volatile.Read(ref _disposed));
+            Volatile.Read(ref _accepting) && !Volatile.Read(ref _disposed))
+        {
+            ActiveKeyCount = Volatile.Read(ref _activeKeyCount),
+            AverageBusyWorkers = Volatile.Read(ref _averageBusyWorkers),
+            ReadyKeyWaitMilliseconds = Volatile.Read(ref _readyKeyWaitMilliseconds),
+            CapacityLimit = Volatile.Read(ref _capacityLimit),
+            ProcessCpuUtilization = Volatile.Read(ref _processCpuUtilization)
+        };
     }
 
     public void Enqueue(TKey key, TMessage message, CancellationToken cancellationToken = default)
@@ -215,6 +266,7 @@ public sealed class KeyedOrderedDispatcher<TKey, TMessage> : IAsyncDisposable
                 if (!state.Active)
                 {
                     state.Active = true;
+                    Interlocked.Increment(ref _activeKeyCount);
                     shouldSchedule = true;
                 }
             }
@@ -295,6 +347,7 @@ public sealed class KeyedOrderedDispatcher<TKey, TMessage> : IAsyncDisposable
         {
             _stopCts.Dispose();
             _scaleCts.Dispose();
+            _cpuProcess?.Dispose();
         }
     }
 
@@ -338,14 +391,42 @@ public sealed class KeyedOrderedDispatcher<TKey, TMessage> : IAsyncDisposable
                 return;
             }
 
-            var result = scalingPolicy.Observe(
-                new ScalingSnapshot(
-                    Volatile.Read(ref _workerCount),
-                    Volatile.Read(ref _desiredWorkerCount),
-                    Volatile.Read(ref _busyWorkers),
-                    Volatile.Read(ref _readyKeyCount),
-                    Interlocked.Read(ref _completedMessages),
-                    Stopwatch.GetTimestamp()));
+            var busyTicks = _retiredBusyTicks;
+            foreach (var worker in _workers)
+            {
+                busyTicks += worker.ReadBusyTicks();
+            }
+
+            var timestamp = Stopwatch.GetTimestamp();
+            var elapsed = Stopwatch.GetElapsedTime(_lastLoadTimestamp, timestamp).TotalSeconds;
+            var averageBusy = elapsed > 0
+                ? (busyTicks - _lastBusyTicks) / (elapsed * Stopwatch.Frequency)
+                : 0;
+            var cpuTime = _cpuProcess!.TotalProcessorTime;
+            var cpu = elapsed > 0
+                ? Math.Clamp((cpuTime - _lastCpuTime).TotalSeconds / elapsed / Environment.ProcessorCount, 0, 1)
+                : 0;
+            _lastLoadTimestamp = timestamp;
+            _lastBusyTicks = busyTicks;
+            _lastCpuTime = cpuTime;
+            var readyWait = _readyKeys.Reader.TryPeek(out var oldest)
+                ? Stopwatch.GetElapsedTime(oldest.ReadyTimestamp, Math.Max(oldest.ReadyTimestamp, timestamp))
+                : TimeSpan.Zero;
+            var result = scalingPolicy.Observe(new LoadSnapshot(
+                Volatile.Read(ref _workerCount),
+                Volatile.Read(ref _desiredWorkerCount),
+                Volatile.Read(ref _activeKeyCount),
+                Volatile.Read(ref _readyKeyCount),
+                averageBusy,
+                readyWait,
+                Interlocked.Read(ref _completedMessages),
+                cpu,
+                timestamp));
+
+            Volatile.Write(ref _averageBusyWorkers, scalingPolicy.AverageBusyWorkers);
+            Volatile.Write(ref _readyKeyWaitMilliseconds, readyWait.TotalMilliseconds);
+            Volatile.Write(ref _processCpuUtilization, cpu);
+            Volatile.Write(ref _capacityLimit, scalingPolicy.CapacityLimit);
 
             PublishScalingResult(result);
             Volatile.Write(ref _desiredWorkerCount, result.DesiredWorkerCount);
@@ -410,24 +491,32 @@ public sealed class KeyedOrderedDispatcher<TKey, TMessage> : IAsyncDisposable
                     return;
                 }
 
-                while (_readyKeys.Reader.TryRead(out var key))
+                while (_readyKeys.Reader.TryRead(out var readyKey))
                 {
                     Interlocked.Decrement(ref _readyKeyCount);
                     Interlocked.Increment(ref _busyWorkers);
+                    if (_scalingPolicy is not null)
+                    {
+                        registration.BeginProcessing();
+                    }
                     var shouldReschedule = false;
 
                     try
                     {
-                        shouldReschedule = ProcessKey(key, cancellationToken);
+                        shouldReschedule = ProcessKey(readyKey.Key, cancellationToken);
                     }
                     finally
                     {
+                        if (_scalingPolicy is not null)
+                        {
+                            registration.EndProcessing();
+                        }
                         Interlocked.Decrement(ref _busyWorkers);
                     }
 
                     if (shouldReschedule)
                     {
-                        ScheduleKey(key);
+                        ScheduleKey(readyKey.Key);
                     }
 
                     if (TryClaimRetirement(registration))
@@ -488,6 +577,11 @@ public sealed class KeyedOrderedDispatcher<TKey, TMessage> : IAsyncDisposable
         }
 
         if (IsTerminalDrain())
+        {
+            return false;
+        }
+
+        if (Volatile.Read(ref _workerCount) <= Volatile.Read(ref _desiredWorkerCount))
         {
             return false;
         }
@@ -642,6 +736,7 @@ public sealed class KeyedOrderedDispatcher<TKey, TMessage> : IAsyncDisposable
             else
             {
                 state.Active = false;
+                Interlocked.Decrement(ref _activeKeyCount);
             }
         }
 
@@ -688,7 +783,8 @@ public sealed class KeyedOrderedDispatcher<TKey, TMessage> : IAsyncDisposable
         // The channel is unbounded, so TryWrite only fails after the writer is completed
         // (pending drained to zero after Complete, or dispose). Either way workers are done
         // with this key; just roll back the counter.
-        if (!_readyKeys.Writer.TryWrite(key))
+        if (!_readyKeys.Writer.TryWrite(new ReadyKey(key,
+                _scalingPolicy is null ? 0 : Stopwatch.GetTimestamp())))
         {
             Interlocked.Decrement(ref _readyKeyCount);
         }
@@ -772,6 +868,7 @@ public sealed class KeyedOrderedDispatcher<TKey, TMessage> : IAsyncDisposable
             var worker = _workers[i];
             if (worker.WorkerTask.IsCompleted)
             {
+                _retiredBusyTicks += worker.ReadBusyTicks();
                 worker.Dispose();
                 _workers.RemoveAt(i);
             }
@@ -812,7 +909,10 @@ public sealed class KeyedOrderedDispatcher<TKey, TMessage> : IAsyncDisposable
 
     private void FinishGracefulDrain()
     {
-        Volatile.Write(ref _desiredWorkerCount, 0);
+        lock (_workersLock)
+        {
+            Volatile.Write(ref _desiredWorkerCount, 0);
+        }
         _scaleCts.Cancel();
         _readyKeys.Writer.TryComplete();
     }
