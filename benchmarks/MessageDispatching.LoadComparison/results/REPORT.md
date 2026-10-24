@@ -1,6 +1,6 @@
 # 新旧扩容算法实测对比
 
-旧版：`9d1663ce2d58191ea6cd4a9d56cfda82ba8266ff`；新版：`feature/load-matched-scaling` 的工作树。
+旧版：`9d1663ce2d58191ea6cd4a9d56cfda82ba8266ff`；新版实测代码：`f471405b05d278e28a0b73bf0bf87a19307a5a23`。
 UTC 时间：2026-10-24T08:16:21.6372963Z。每类场景新旧各 3 轮，投递期 12 秒。
 
 环境：20 个可见逻辑 CPU，.NET 8 Release。固定 CPU 工作量：66 passes/消息；共享校准容量：2419 条/秒。

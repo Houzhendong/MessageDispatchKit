@@ -7,23 +7,13 @@ public sealed class DynamicScalingOptions
 
     public TimeSpan SampleInterval { get; init; } = TimeSpan.FromMilliseconds(500);
 
-    public double MinimumUsefulThroughputGain { get; init; } = 0.02;
+    public double CapacityGainTolerance { get; init; } = 0.02;
 
     public double ThroughputSmoothingFactor { get; init; } = 0.25;
 
-    public int ProbeWarmupSamples { get; init; } = 1;
-
-    public int ThroughputMeasurementSamples { get; init; } = 3;
-
-    // Includes convergence and warmup; restarting a measurement window does not extend the deadline.
-    public TimeSpan ProbeTimeout { get; init; } = TimeSpan.FromSeconds(10);
-
-    public TimeSpan ScaleUpCooldown { get; init; } = TimeSpan.FromSeconds(2);
-
     public TimeSpan ScaleDownIdleDuration { get; init; } = TimeSpan.FromSeconds(5);
 
-    // Keyed dispatcher load matching. The probe settings above continue to configure
-    // MessageDispatcher; MinimumUsefulThroughputGain also supplies the capacity guard tolerance.
+    // Both dispatchers use the same load-matching controller.
     public double TargetUtilization { get; init; } = 0.8;
 
     public TimeSpan UtilizationWindow { get; init; } = TimeSpan.FromSeconds(1);
@@ -50,11 +40,11 @@ public sealed class DynamicScalingOptions
                 $"SampleInterval must be at least 1ms and no greater than {MaximumTimerInterval}.");
         }
 
-        if (!double.IsFinite(MinimumUsefulThroughputGain) || MinimumUsefulThroughputGain < 0)
+        if (!double.IsFinite(CapacityGainTolerance) || CapacityGainTolerance < 0)
         {
             throw new ArgumentOutOfRangeException(
-                nameof(MinimumUsefulThroughputGain),
-                "MinimumUsefulThroughputGain must be finite and zero or greater.");
+                nameof(CapacityGainTolerance),
+                "CapacityGainTolerance must be finite and zero or greater.");
         }
 
         if (!double.IsFinite(ThroughputSmoothingFactor) ||
@@ -64,34 +54,6 @@ public sealed class DynamicScalingOptions
             throw new ArgumentOutOfRangeException(
                 nameof(ThroughputSmoothingFactor),
                 "ThroughputSmoothingFactor must be finite, greater than zero, and no greater than one.");
-        }
-
-        if (ProbeWarmupSamples < 0)
-        {
-            throw new ArgumentOutOfRangeException(
-                nameof(ProbeWarmupSamples),
-                "ProbeWarmupSamples must be zero or greater.");
-        }
-
-        if (ThroughputMeasurementSamples <= 0)
-        {
-            throw new ArgumentOutOfRangeException(
-                nameof(ThroughputMeasurementSamples),
-                "ThroughputMeasurementSamples must be greater than zero.");
-        }
-
-        if (ProbeTimeout <= TimeSpan.Zero)
-        {
-            throw new ArgumentOutOfRangeException(
-                nameof(ProbeTimeout),
-                "ProbeTimeout must be greater than zero.");
-        }
-
-        if (ScaleUpCooldown < TimeSpan.Zero)
-        {
-            throw new ArgumentOutOfRangeException(
-                nameof(ScaleUpCooldown),
-                "ScaleUpCooldown must be zero or greater.");
         }
 
         if (ScaleDownIdleDuration < TimeSpan.Zero)

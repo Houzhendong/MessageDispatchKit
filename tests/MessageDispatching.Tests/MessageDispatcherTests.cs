@@ -351,6 +351,81 @@ public sealed class MessageDispatcherTests
         Assert.Equal(1, transformer.MaxConcurrency);
     }
 
+    [Fact]
+    public async Task SubscriberWorkCountsAsLoadBeforeAnyInputCompletes()
+    {
+        using var subscriber = new GatedSubscriber();
+        await using var dispatcher = new MessageDispatcher<int, string>(CreateDynamicOptions(1, 2));
+        using var subscription = dispatcher.Subscribe(subscriber);
+        dispatcher.Start(new PrefixTransformer());
+        try
+        {
+            dispatcher.Enqueue(0);
+            await TestWait.UntilAsync(() => dispatcher.GetStats().AverageBusyWorkers > 0.8);
+            Assert.Equal(0, dispatcher.GetStats().CompletedMessages);
+            dispatcher.Enqueue(1);
+            await TestWait.UntilAsync(() => subscriber.StartedCount == 2);
+            Assert.Equal(2, dispatcher.GetStats().WorkerCount);
+            Assert.Equal(0, dispatcher.GetStats().CompletedMessages);
+        }
+        finally
+        {
+            subscriber.Release();
+            await dispatcher.CompleteAsync();
+        }
+        Assert.Equal(2, dispatcher.GetStats().CompletedMessages);
+    }
+
+    [Fact]
+    public async Task IndependentQueueWaitIsMeasuredAndResourceBudgetBoundsGrowth()
+    {
+        using var transformer = new SelectiveGatedTransformer();
+        var changes = new ConcurrentQueue<DispatcherScaleChange>();
+        await using var dispatcher = new MessageDispatcher<int, string>(new DispatcherOptions
+        {
+            Parallelism = 1,
+            MaxParallelism = 8,
+            ScaleObserver = changes.Enqueue,
+            DynamicScaling = new DynamicScalingOptions
+            {
+                SampleInterval = TimeSpan.FromMilliseconds(20),
+                ResourceParallelismLimit = 2,
+                UtilizationWindow = TimeSpan.FromMilliseconds(40),
+                ScaleUpInterval = TimeSpan.FromMilliseconds(20)
+            }
+        });
+        dispatcher.Start(transformer);
+        try
+        {
+            for (var i = 0; i < 8; i++) dispatcher.Enqueue(i);
+            await TestWait.UntilAsync(() => dispatcher.GetStats().WorkerCount == 2);
+            await TestWait.UntilAsync(() => dispatcher.GetStats().QueueWaitMilliseconds > 80);
+            Assert.Equal(2, dispatcher.GetStats().CapacityLimit);
+            Assert.Equal(2, dispatcher.GetStats().WorkerCount);
+            Assert.DoesNotContain(changes, change => change.CurrentWorkerCount > 2);
+        }
+        finally
+        {
+            transformer.ReleaseAll();
+            await dispatcher.CompleteAsync();
+        }
+        Assert.Equal(8, dispatcher.GetStats().CompletedMessages);
+    }
+
+    private sealed class GatedSubscriber : IMessageSubscriber<string>, IDisposable
+    {
+        private readonly ManualResetEventSlim _release = new();
+        private int _started;
+        public int StartedCount => Volatile.Read(ref _started);
+        public void Handle(string message, CancellationToken cancellationToken)
+        {
+            Interlocked.Increment(ref _started);
+            _release.Wait(cancellationToken);
+        }
+        public void Release() => _release.Set();
+        public void Dispose() => _release.Dispose();
+    }
+
     private static DispatcherOptions CreateDynamicOptions(
         int parallelism,
         int maxParallelism,
@@ -363,10 +438,11 @@ public sealed class MessageDispatcherTests
             DynamicScaling = new DynamicScalingOptions
             {
                 SampleInterval = TimeSpan.FromMilliseconds(20),
-                MinimumUsefulThroughputGain = 0,
+                ResourceParallelismLimit = maxParallelism,
+                UtilizationWindow = TimeSpan.FromMilliseconds(40),
+                ScaleUpInterval = TimeSpan.FromMilliseconds(20),
+                CapacityGainTolerance = 0,
                 ThroughputSmoothingFactor = 1,
-                ProbeWarmupSamples = 0,
-                ScaleUpCooldown = TimeSpan.FromMilliseconds(20),
                 ScaleDownIdleDuration = TimeSpan.FromMilliseconds(40)
             },
             ScaleObserver = scaleObserver

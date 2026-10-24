@@ -120,7 +120,7 @@ public sealed class LoadMatchingScalingPolicyTests
     }
 
     [Fact]
-    public void SlowSamplingDoesNotDependOnLegacyProbeTimeout()
+    public void SlowSamplingCanScaleWithoutAMeasurementDeadline()
     {
         var policy = Create();
         Observe(policy, 0, workers: 1, busy: 1, active: 32, ready: 31);
@@ -198,6 +198,17 @@ public sealed class LoadMatchingScalingPolicyTests
         var result = Observe(policy, 6, workers: 65, busy: 65, active: 100, ready: 35, completed: 38700);
         Assert.Equal(65, policy.CapacityLimit);
         Assert.Equal(65, result.DesiredWorkerCount);
+    }
+
+    [Fact]
+    public void IndependentMessageCountsCanExceedInt32WithoutOverflowingTarget()
+    {
+        var policy = Create();
+        var first = new LoadSnapshot(16, 16, long.MaxValue, long.MaxValue, 16,
+            TimeSpan.FromSeconds(1), 0, 0, 0);
+        policy.Observe(first);
+        var result = policy.Observe(first with { Timestamp = Stopwatch.Frequency, CompletedMessages = 100 });
+        Assert.Equal(20, result.DesiredWorkerCount);
     }
 
     private static LoadMatchingScalingPolicy Create(int minimum = 1, int resourceLimit = 32,

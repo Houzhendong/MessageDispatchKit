@@ -93,7 +93,6 @@ internal static class ScenarioRunner
                 workloads: [HomogeneousWork],
                 targetPending: 1024,
                 maxParallelism: options.MaxParallelism),
-
             "keyed-heterogeneous" => RunKeyedSustainedAsync(
                 new ScenarioMetadata(
                     scenario,
@@ -104,7 +103,6 @@ internal static class ScenarioRunner
                 workloads: HeterogeneousWork,
                 targetPending: 128,
                 maxParallelism: options.MaxParallelism),
-
             "keyed-1000-keys" => RunKeyedSustainedAsync(
                 new ScenarioMetadata(scenario, "KeyedOrderedDispatcher", ManyKeysWork.Name),
                 options,
@@ -112,7 +110,6 @@ internal static class ScenarioRunner
                 workloads: [ManyKeysWork],
                 targetPending: 2000,
                 maxParallelism: options.MaxParallelism),
-
             "keyed-one-hot-key" => RunKeyedSustainedAsync(
                 new ScenarioMetadata(scenario, "KeyedOrderedDispatcher", HomogeneousWork.Name),
                 options,
@@ -120,7 +117,6 @@ internal static class ScenarioRunner
                 workloads: [HomogeneousWork],
                 targetPending: 256,
                 maxParallelism: options.MaxParallelism),
-
             "keyed-four-hot-keys" => RunKeyedSustainedAsync(
                 new ScenarioMetadata(scenario, "KeyedOrderedDispatcher", HomogeneousWork.Name),
                 options,
@@ -128,7 +124,6 @@ internal static class ScenarioRunner
                 workloads: [HomogeneousWork],
                 targetPending: 512,
                 maxParallelism: 32),
-
             "keyed-low-to-high-burst" => RunKeyedBurstAsync(
                 new ScenarioMetadata(scenario, "KeyedOrderedDispatcher", BurstWork.Name),
                 options,
@@ -136,14 +131,12 @@ internal static class ScenarioRunner
                 workloads: [BurstWork],
                 highTargetPending: 1024,
                 maxParallelism: options.MaxParallelism),
-
             "message-homogeneous" => RunMessageSustainedAsync(
                 new ScenarioMetadata(scenario, "MessageDispatcher", HomogeneousWork.Name),
                 options,
                 workloads: [HomogeneousWork],
                 targetPending: 1024,
                 maxParallelism: options.MaxParallelism),
-
             _ => throw new ArgumentOutOfRangeException(nameof(scenario), scenario, "Unknown scenario.")
         };
     }
@@ -375,10 +368,9 @@ internal static class ScenarioRunner
             DynamicScaling = new DynamicScalingOptions
             {
                 SampleInterval = benchmarkOptions.ScalingSampleInterval,
-                MinimumUsefulThroughputGain = 0.02,
+                CapacityGainTolerance = 0.02,
                 ThroughputSmoothingFactor = 0.25,
-                ProbeWarmupSamples = 1,
-                ScaleUpCooldown = TimeSpan.FromMilliseconds(Math.Max(500, sampleMilliseconds * 2)),
+                ScaleUpInterval = TimeSpan.FromMilliseconds(Math.Max(500, sampleMilliseconds * 2)),
                 ScaleDownIdleDuration = TimeSpan.FromMilliseconds(Math.Max(750, sampleMilliseconds * 3))
             }
         };

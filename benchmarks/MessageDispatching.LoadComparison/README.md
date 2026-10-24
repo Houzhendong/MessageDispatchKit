@@ -4,6 +4,11 @@
 不切换分支、不修改工作树或索引。相同的 harness 分别链接旧版和当前 Release DLL，
 运行在独立进程中，不通过改写当前算法来模拟旧行为。
 
+当前库已删除旧 probe API，harness 只通过反射为历史 DLL 设置其旧 cooldown，
+不需要把旧算法或旧 API 保留在当前运行库中。
+仓库内已有的 30 轮实测对应新版实现提交 `f471405`；其结果和原始字段保持原样，
+不冒充之后清理 API、迁移普通 dispatcher 的重新测量结果。报告元数据记录实测来源。
+
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File `
   benchmarks/MessageDispatching.LoadComparison/Compare.ps1 `

@@ -408,10 +408,8 @@ public sealed class KeyedOrderedDispatcherTests
                 ResourceParallelismLimit = maxParallelism,
                 UtilizationWindow = TimeSpan.FromMilliseconds(40),
                 ScaleUpInterval = TimeSpan.FromMilliseconds(20),
-                MinimumUsefulThroughputGain = 0,
+                CapacityGainTolerance = 0,
                 ThroughputSmoothingFactor = 1,
-                ProbeWarmupSamples = 0,
-                ScaleUpCooldown = TimeSpan.FromMilliseconds(20),
                 ScaleDownIdleDuration = TimeSpan.FromMilliseconds(40)
             },
             ScaleObserver = scaleObserver

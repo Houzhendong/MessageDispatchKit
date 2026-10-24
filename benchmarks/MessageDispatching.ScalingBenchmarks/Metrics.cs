@@ -17,9 +17,10 @@ internal readonly record struct MetricSnapshot(
     bool IsSaturated,
     long ScaleUpCount,
     long ScaleDownCount,
-    long ProbeAcceptCount,
-    long ProbeRejectCount,
-    double? LastProbeGain,
+    double AverageBusyWorkers,
+    double QueueWaitMilliseconds,
+    int CapacityLimit,
+    double ProcessCpuUtilization,
     bool Accepting)
 {
     public static MetricSnapshot From(KeyedDispatcherStats stats)
@@ -37,9 +38,10 @@ internal readonly record struct MetricSnapshot(
             stats.IsSaturated,
             stats.ScaleUpCount,
             stats.ScaleDownCount,
-            stats.ProbeAcceptCount,
-            stats.ProbeRejectCount,
-            stats.LastProbeGain,
+            stats.AverageBusyWorkers,
+            stats.ReadyKeyWaitMilliseconds,
+            stats.CapacityLimit,
+            stats.ProcessCpuUtilization,
             stats.Accepting);
     }
 
@@ -58,9 +60,10 @@ internal readonly record struct MetricSnapshot(
             stats.IsSaturated,
             stats.ScaleUpCount,
             stats.ScaleDownCount,
-            stats.ProbeAcceptCount,
-            stats.ProbeRejectCount,
-            stats.LastProbeGain,
+            stats.AverageBusyWorkers,
+            stats.QueueWaitMilliseconds,
+            stats.CapacityLimit,
+            stats.ProcessCpuUtilization,
             stats.Accepting);
     }
 }
@@ -171,9 +174,10 @@ internal static class CsvReporter
         "saturated",
         "scale_up_count",
         "scale_down_count",
-        "probe_accept_count",
-        "probe_reject_count",
-        "last_probe_gain",
+        "average_busy_workers",
+        "queue_wait_ms",
+        "capacity_limit",
+        "process_cpu_utilization",
         "accepting",
         "peak_workers",
         "max_processing_concurrency",
@@ -246,9 +250,10 @@ internal static class CsvReporter
             stats.IsSaturated ? "true" : "false",
             stats.ScaleUpCount.ToString(invariant),
             stats.ScaleDownCount.ToString(invariant),
-            stats.ProbeAcceptCount.ToString(invariant),
-            stats.ProbeRejectCount.ToString(invariant),
-            stats.LastProbeGain?.ToString("F6", invariant) ?? string.Empty,
+            stats.AverageBusyWorkers.ToString("F3", invariant),
+            stats.QueueWaitMilliseconds.ToString("F3", invariant),
+            stats.CapacityLimit.ToString(invariant),
+            stats.ProcessCpuUtilization.ToString("F3", invariant),
             stats.Accepting ? "true" : "false",
             measurements.PeakWorkers.ToString(invariant),
             measurements.MaxProcessingConcurrency.ToString(invariant),

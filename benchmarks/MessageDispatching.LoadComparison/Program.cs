@@ -58,14 +58,15 @@ var options = new DispatcherOptions
     DynamicScaling = new DynamicScalingOptions
     {
         SampleInterval = TimeSpan.FromMilliseconds(100),
-        ScaleUpCooldown = TimeSpan.FromMilliseconds(200),
         ScaleDownIdleDuration = TimeSpan.FromSeconds(1),
-        ThroughputSmoothingFactor = 0.25,
-        ProbeWarmupSamples = 1
+        ThroughputSmoothingFactor = 0.25
     },
     ScaleObserver = change => changes.Enqueue((clock.Elapsed.TotalSeconds, change.CurrentWorkerCount))
 };
-// This file only uses the baseline public API, including positional stats members.
+// The old controller is built from git. Configure its removed option only when
+// linking that assembly; the current library has no legacy strategy or probe API.
+typeof(DynamicScalingOptions).GetProperty("ScaleUpCooldown")?
+    .SetValue(options.DynamicScaling, TimeSpan.FromMilliseconds(200));
 await using var dispatcher = new KeyedOrderedDispatcher<int, Message>(options);
 handler.Warmup();
 using var process = Process.GetCurrentProcess();
@@ -154,7 +155,7 @@ var result = new
     PeakWorkers = changes.Select(change => change.Workers).Append(1).Max(),
     LateAverageWorkers = samples.Where(sample => sample.Seconds >= duration * 0.75 && sample.Seconds <= duration)
         .Select(sample => (double)sample.Workers).DefaultIfEmpty(1).Average(),
-    stats.ScaleUpCount, stats.ScaleDownCount, stats.ProbeAcceptCount, stats.ProbeRejectCount,
+    stats.ScaleUpCount, stats.ScaleDownCount,
     handler.OrderingViolations, handler.ConcurrencyViolations, handler.Errors,
     Checksum = handler.Checksum, Valid = true
 };

@@ -13,9 +13,6 @@ public readonly record struct KeyedDispatcherStats(
     bool IsSaturated,
     long ScaleUpCount,
     long ScaleDownCount,
-    long ProbeAcceptCount,
-    long ProbeRejectCount,
-    double? LastProbeGain,
     bool Accepting)
 {
     public int ActiveKeyCount { get; init; }
