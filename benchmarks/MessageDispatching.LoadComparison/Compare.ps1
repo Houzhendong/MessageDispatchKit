@@ -58,6 +58,8 @@ try {
     if ($LASTEXITCODE -ne 0 -or $passes -lt 1 -or $capacity -le 0) { throw 'CPU work calibration failed.' }
     $metadata = [ordered]@{
         Baseline = $commit; Branch = (& git branch --show-current).Trim()
+        NewSourceRevision = (& git rev-parse HEAD).Trim()
+        NewWorkingTreeDirty = @(& git status --porcelain).Count -gt 0
         DateUtc = [DateTime]::UtcNow.ToString('O'); Repeats = $Repeats
         DurationSeconds = $DurationSeconds; WorkPasses = $passes
         CalibratedCapacityPerSecond = $capacity

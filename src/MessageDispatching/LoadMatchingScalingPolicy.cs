@@ -2,13 +2,28 @@ using System.Diagnostics;
 
 namespace MessageDispatching;
 
+internal readonly record struct ScalingResult(
+    int DesiredWorkerCount,
+    ScalingReason Reason,
+    double Throughput,
+    double SmoothedThroughput,
+    bool IsSaturated);
+
+internal enum ScalingReason
+{
+    None,
+    LoadScaleUp,
+    LoadScaleDown,
+    CapacityLimited
+}
+
 internal readonly record struct LoadSnapshot(
     int WorkerCount,
     int DesiredWorkerCount,
-    int ActiveKeyCount,
-    int ReadyKeyCount,
+    long RunnableWorkCount,
+    long ReadyWorkCount,
     double AverageBusyWorkers,
-    TimeSpan ReadyKeyWait,
+    TimeSpan QueueWait,
     long CompletedMessages,
     double CpuUtilization,
     long Timestamp);
@@ -57,7 +72,7 @@ internal sealed class LoadMatchingScalingPolicy
     {
         var saturated = snapshot.WorkerCount > 0 &&
             snapshot.AverageBusyWorkers >= snapshot.WorkerCount * _options.TargetUtilization &&
-            snapshot.ReadyKeyCount > 0;
+            snapshot.ReadyWorkCount > 0;
 
         if (!_initialized || snapshot.Timestamp <= _lastTimestamp ||
             snapshot.CompletedMessages < _lastCompleted)
@@ -100,13 +115,13 @@ internal sealed class LoadMatchingScalingPolicy
 
         var demand = (int)Math.Min(int.MaxValue,
             Math.Ceiling(_averageBusy / _options.TargetUtilization));
-        if (snapshot.ReadyKeyCount > 0 && snapshot.ReadyKeyWait >= _options.TargetQueueWait)
+        if (snapshot.ReadyWorkCount > 0 && snapshot.QueueWait >= _options.TargetQueueWait)
         {
             demand = Math.Max(demand, AddStep(snapshot.WorkerCount));
         }
 
-        var desired = Math.Clamp(Math.Min(demand,
-            Math.Min(snapshot.ActiveKeyCount, _capacityLimit)), _minimum, _maximum);
+        var desired = (int)Math.Clamp(Math.Min(demand,
+            Math.Min(snapshot.RunnableWorkCount, _capacityLimit)), _minimum, _maximum);
 
         if (desired > snapshot.WorkerCount)
         {
@@ -169,7 +184,7 @@ internal sealed class LoadMatchingScalingPolicy
             return false;
         }
 
-        if (snapshot.ReadyKeyCount == 0 || snapshot.ActiveKeyCount <= snapshot.WorkerCount ||
+        if (snapshot.ReadyWorkCount == 0 || snapshot.RunnableWorkCount <= snapshot.WorkerCount ||
             snapshot.AverageBusyWorkers < snapshot.WorkerCount * _options.TargetUtilization)
         {
             ResetCapacityWindow();
@@ -200,7 +215,7 @@ internal sealed class LoadMatchingScalingPolicy
         }
 
         var limited = _referenceThroughput is > 0 && snapshot.WorkerCount > _referenceWorkers &&
-            rate <= _referenceThroughput.Value * (1 + _options.MinimumUsefulThroughputGain);
+            rate <= _referenceThroughput.Value * (1 + _options.CapacityGainTolerance);
         if (limited)
         {
             // A small positive gain still helps load matching. Keep it and pause further
@@ -226,7 +241,7 @@ internal sealed class LoadMatchingScalingPolicy
     }
 
     private ScalingResult Result(int desired, ScalingReason reason, double throughput, bool saturated)
-        => new(desired, reason, throughput, _smoothedThroughput, saturated, null);
+        => new(desired, reason, throughput, _smoothedThroughput, saturated);
 
     private static int AddStep(int workers)
         => (int)Math.Min(int.MaxValue, (long)workers + Math.Max(1, workers / 4));

@@ -16,10 +16,9 @@ public static class NoKeySample
                 DynamicScaling = new DynamicScalingOptions
                 {
                     SampleInterval = TimeSpan.FromMilliseconds(50),
-                    MinimumUsefulThroughputGain = 0,
+                    CapacityGainTolerance = 0,
                     ThroughputSmoothingFactor = 1,
-                    ProbeWarmupSamples = 0,
-                    ScaleUpCooldown = TimeSpan.FromMilliseconds(100),
+                    ScaleUpInterval = TimeSpan.FromMilliseconds(100),
                     ScaleDownIdleDuration = TimeSpan.FromMilliseconds(250)
                 },
                 ScaleObserver = static change =>
@@ -69,8 +68,8 @@ public static class NoKeySample
         Console.WriteLine($"no-key workers after scale down: {finalStats.WorkerCount}");
         Console.WriteLine(
             $"no-key throughput={finalStats.Throughput:F1}, smoothed={finalStats.SmoothedThroughput:F1}, " +
-            $"accepted={finalStats.ProbeAcceptCount}, rejected={finalStats.ProbeRejectCount}, " +
-            $"last gain={finalStats.LastProbeGain:P2}");
+            $"average busy={finalStats.AverageBusyWorkers:F2}, " +
+            $"capacity={finalStats.CapacityLimit}");
 
         await dispatcher.CompleteAsync();
 

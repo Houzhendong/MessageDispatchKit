@@ -7,7 +7,7 @@
 - `KeyedOrderedDispatcher<TKey, TMessage>`：同一个 key 严格顺序执行，不同 key 可并行。
 - `MessageDispatcher<TInput, TOutput>`：无 key 的并行转换与订阅发布，不提供消息间顺序保证。
 
-典型 workload 是解压、protobuf / MessagePack 反序列化和少量 CPU 处理。keyed dispatcher 使用目标利用率、就绪 key 等待和资源预算匹配负载；普通 dispatcher 使用吞吐量探测式 hill climbing。
+典型 workload 是解压、protobuf / MessagePack 反序列化和少量 CPU 处理。两个 dispatcher 共用目标利用率、队列等待和资源预算驱动的负载匹配控制器。
 
 ## 代码结构
 
@@ -19,8 +19,9 @@ src/MessageDispatching/
   KeyedDispatcherStats.cs
   DispatcherScalingStats.cs
   DispatcherScaleChange.cs
-  DynamicScalingPolicy.cs
   LoadMatchingScalingPolicy.cs
+  DispatcherLoadMonitor.cs
+  WorkerRegistration.cs
   KeyedOrderedDispatcher.cs
   MessageDispatcher.cs
 
@@ -30,7 +31,7 @@ samples/DispatcherSample/
 
 tests/MessageDispatching.Tests/
   DispatcherOptionsTests.cs
-  DynamicScalingPolicyTests.cs
+  LoadMatchingScalingPolicyTests.cs
   KeyedOrderedDispatcherTests.cs
   MessageDispatcherTests.cs
 
@@ -122,148 +123,24 @@ await dispatcher.CompleteAsync(ct);
 
 ## 动态扩缩容
 
-keyed dispatcher 的当前算法、配置和指标见 [负载匹配扩缩容](docs/load-matching-scaling.md)，
-新旧版本的实测见 [对比程序](benchmarks/MessageDispatching.LoadComparison/README.md)。
-下面的吞吐 probe 状态机仍用于普通 dispatcher，也是 `9d1663c` 旧 keyed 版本的对照策略。
+两个 dispatcher 都使用 `LoadMatchingScalingPolicy`。算法、配置、API 迁移和指标见
+[负载匹配扩缩容](docs/load-matching-scaling.md)。
+历史新旧版本实测及复现脚本见 [对比程序](benchmarks/MessageDispatching.LoadComparison/README.md)。
+旧吞吐 probe 状态机已删除，对照版本直接从 git 提交构建。
 
-### 启用方式
+- `MaxParallelism == 0` 或等于 `Parallelism`：固定并行度。
+- `MaxParallelism > Parallelism`：启用动态调整；`Parallelism` 是启动数量及缩容下限。
+- 基础需求为 `ceil(平均 busy workers / TargetUtilization)`。
+- 就绪工作等待超过 `TargetQueueWait` 时增加需求，目标受独立工作量及资源预算限制。
+- keyed 的独立工作量是去重活跃 key 数；普通 dispatcher 的每条消息都能独立执行。
+- 扩容按 `ScaleUpInterval` 分步进行，CPU 压力达到阈值时暂停增员。
+- 部分负载持续达到 `ScaleDownIdleDuration` 后也可以缩容，不要求所有 worker 空闲。
+- 吞吐只作观测和辅助容量校准，不再执行逐次 probe。
 
-`MaxParallelism == 0` 表示固定并行度。只有 `MaxParallelism > Parallelism` 时启用动态扩缩容。
-
-- `Parallelism`：启动 worker 数，同时也是缩容下限。
-- `MaxParallelism`：动态扩容上限。
-- `DynamicScaling`：采样、收益阈值、warmup、cooldown 和 idle 缩容配置。
-
-```csharp
-new DispatcherOptions
-{
-    Parallelism = 4,
-    MaxParallelism = 32,
-    DynamicScaling = new DynamicScalingOptions
-    {
-        SampleInterval = TimeSpan.FromMilliseconds(500),
-        MinimumUsefulThroughputGain = 0.02,
-        ThroughputSmoothingFactor = 0.25,
-        ProbeWarmupSamples = 1,
-        ScaleUpCooldown = TimeSpan.FromSeconds(2),
-        ScaleDownIdleDuration = TimeSpan.FromSeconds(5)
-    }
-}
-```
-
-### 核心信号
-
-```text
-Saturation
-  -> 证明额外 worker 当前有独立工作可做
-
-Throughput
-  -> 证明新增 worker 是否值得保留
-```
-
-饱和条件：
-
-```text
-WorkerCount > 0
-&& BusyWorkers >= WorkerCount
-&& ReadyWorkItemCount > 0
-```
-
-- keyed：`ReadyWorkItemCount` 是 `ReadyKeyCount`。
-- no-key：`ReadyWorkItemCount` 是 `QueuedMessageCount`。
-
-可利用并行度近似：
-
-```text
-BusyWorkers + ReadyWorkItemCount
-```
-
-keyed dispatcher 不使用 `PendingMessages` 推断 worker 上限。一个 key 即使积压一百万条消息，有效并行度仍然只有一。
-
-### Throughput 与 EWMA
-
-每个 controller sample 使用累计完成数的 delta：
-
-```text
-Throughput = Delta CompletedMessages / Delta TimeSeconds
-```
-
-不能使用 `CompletedMessages / dispatcher lifetime`。实现使用实际 `Stopwatch` 时间，不在每条消息上记录 timestamp。
-
-EWMA：
-
-```text
-Smoothed = alpha * Current + (1 - alpha) * Previous
-```
-
-第一个有效样本直接初始化 EWMA，不与人为的零值混合。
-
-`CompletedMessages` 表示处理尝试已经结束：handler/transformer 成功或抛异常都计数；入队失败回滚 pending 时不计数。
-
-### Scale-up probe
-
-稳定状态且真实饱和时记录 baseline，然后使用持久化的自适应 probe step 试探。`NextProbeStep` 初始为 `1`；baseline throughput 为正时使用该值，为零时无论历史 step 多大都强制请求 `+1`：
-
-```text
-requestedStep = BaselineThroughput > 0 ? NextProbeStep : 1
-safetyCap = WorkerCount <= 2
-    ? WorkerCount
-    : ceil(WorkerCount / 2)
-actualStep = min(
-    requestedStep,
-    MaxParallelism - WorkerCount,
-    RunnableParallelism - WorkerCount,
-    safetyCap)
-target = WorkerCount + actualStep
-```
-
-`ActiveProbeStep` 记录 cap 后的实际 target delta。后续收益计算和 step 调整都使用该实际 delta，而不是 cap 前的请求值。worker 实际创建完成后，忽略 `ProbeWarmupSamples` 个完整样本，再比较平滑吞吐量：
-
-```text
-gain = (ProbeThroughput - BaselineThroughput) / BaselineThroughput
-relativeWorkerIncrease = ActiveProbeStep / BaselineWorkerCount
-elasticity = gain / relativeWorkerIncrease
-```
-
-- `gain >= MinimumUsefulThroughputGain`：接受整个实际 probe step。
-- 接受正 baseline probe 后：`elasticity >= 0.75` 将下一 step 设为实际 step 的两倍（饱和到 `int.MaxValue`）；`0.25 <= elasticity < 0.75` 保留实际 step；更弱的已接受收益将实际 step 减半，下限为 `1`。
-- 非负有限收益不足而拒绝时，下一 step 设为实际 step 的一半，下限为 `1`；负收益、无 gain、无效 sample 或 probe 期间可利用并行度低于 target 时重置为 `1`。
-- baseline 为零：probe throughput 转为正值才接受，否则回退；不计算相对 gain，接受后下一 step 也重置为 `1`。
-
-拒绝会一次回退整个 `ActiveProbeStep`。失败 probe 的 cooldown 从实际 worker 数完成回退后开始。这样长时间运行的 handler 不会在 worker 尚未退出时消耗完整 cooldown，也不会在物理回退完成前开始下一次 probe。
-
-### DesiredWorkerCount 与 worker 生命周期
-
-Policy 只输出 `DesiredWorkerCount`，不保存 `Task`、worker 或 `CancellationTokenSource`。
-
-```text
-Actual < Desired -> dispatcher 创建 worker
-Actual > Desired -> worker 在安全边界自然退出
-```
-
-retirement token 只用于唤醒阻塞在 channel wait 的空闲 worker，不会传入 handler、transformer 或 subscriber。
-
-安全退休边界：
-
-- keyed：处理并重新调度完整 key batch 之后，或获取下一个 ready key 之前。
-- no-key：完整处理一条消息之后，或等待下一条消息之前。
-
-正在执行的用户代码不会因为 rollback/缩容被 cancel。若用户代码永久阻塞，实际回退也会被相应延迟。
-
-### Idle scale-down
-
-缩容不根据 throughput 下降，因为 throughput 下降可能只是输入减少。
-
-只有以下状态持续达到 `ScaleDownIdleDuration` 才将 desired workers 减一：
-
-```text
-ReadyWorkItemCount == 0
-&& BusyWorkers < DesiredWorkerCount
-&& WorkerCount == DesiredWorkerCount
-&& DesiredWorkerCount > Parallelism
-```
-
-每次实际退休后重新等待完整 idle duration，始终 `-1` 保守缩容。触发 idle scale-down 时会把 `NextProbeStep` 重置为 `1`；workload 返回会重置 idle timer。
+`DispatcherLoadMonitor` 汇总 worker busy 时间、就绪等待和进程 CPU。
+普通 dispatcher 的 busy 时间包含转换和同步 subscriber 投递。
+正在执行的用户代码不会因缩容取消；keyed 在完整 batch 处理并重排后退休，
+普通 worker 在完整消息处理之后退休。阻塞在 channel wait 的空闲 worker 通过独立 token 唤醒退休。
 
 ## Stats
 
@@ -276,14 +153,14 @@ ReadyWorkItemCount == 0
 - `WorkerCount` / `DesiredWorkerCount` / `BusyWorkers`
 - `Throughput` / `SmoothedThroughput` / `IsSaturated`
 - `ScaleUpCount` / `ScaleDownCount`
-- `ProbeAcceptCount` / `ProbeRejectCount` / `LastProbeGain`
 - `Accepting`
 - `ActiveKeyCount` / `AverageBusyWorkers` / `ReadyKeyWaitMilliseconds`
 - `CapacityLimit` / `ProcessCpuUtilization`
 
 ### DispatcherStats
 
-`MessageDispatcher.GetStats()` 使用 `QueuedMessageCount` 替代 keyed 专属字段，其余 scaling 字段一致。
+`MessageDispatcher.GetStats()` 使用 `QueuedMessageCount` 替代 keyed 专属字段，
+提供 `AverageBusyWorkers`、`QueueWaitMilliseconds`、`CapacityLimit` 和 `ProcessCpuUtilization`。
 
 stats 是线程安全计数器的 best-effort 快照，不保证所有字段来自同一个原子瞬间。
 
@@ -292,8 +169,7 @@ stats 是线程安全计数器的 best-effort 快照，不保证所有字段来�
 `ScaleObserver` 只报告实际 worker count 变化：
 
 - 动态 worker 已创建：报告 scale up。
-- probe accepted：不额外报告。
-- probe rejected：desired 先回退，实际 worker 在安全边界退出后才报告 scale down。
+- 缩容建议先降低 desired，实际 worker 在安全边界退出后才报告 scale down。
 - 初始 worker 和关闭时的 worker 退出保持静默。
 
 ```csharp
@@ -347,7 +223,7 @@ handler/transformer 异常会调用各自的 `HandleError`。subscriber 异常�
 - low-to-high burst
 - ordinary dispatcher homogeneous
 
-处理逻辑使用实际 buffer CPU work，不用 `Thread.Sleep` 模拟吞吐。输出 CSV-friendly time series，包括 actual/desired/busy workers、pending/completed、ready count、raw/smoothed throughput、saturation、probe counters 和 gain。
+处理逻辑使用实际 buffer CPU work，不用 `Thread.Sleep` 模拟吞吐。输出 CSV-friendly time series，包括 actual/desired/busy workers、pending/completed、ready count、raw/smoothed throughput、saturation、平均占用、队列等待、容量上限和进程 CPU。
 
 最优 worker 数依赖 CPU 拓扑、运行时、功耗状态和宿主负载，因此 benchmark 只断言顺序和上限等正确性，不硬编码吞吐峰值对应的 worker 数。
 

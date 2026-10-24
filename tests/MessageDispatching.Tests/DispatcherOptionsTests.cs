@@ -15,12 +15,11 @@ public sealed class DispatcherOptionsTests
         Assert.Null(options.ScaleObserver);
         Assert.NotNull(options.DynamicScaling);
         Assert.Equal(TimeSpan.FromMilliseconds(500), options.DynamicScaling.SampleInterval);
-        Assert.Equal(0.02, options.DynamicScaling.MinimumUsefulThroughputGain);
+        Assert.Equal(0.02, options.DynamicScaling.CapacityGainTolerance);
         Assert.Equal(0.25, options.DynamicScaling.ThroughputSmoothingFactor);
-        Assert.Equal(1, options.DynamicScaling.ProbeWarmupSamples);
-        Assert.Equal(3, options.DynamicScaling.ThroughputMeasurementSamples);
-        Assert.Equal(TimeSpan.FromSeconds(10), options.DynamicScaling.ProbeTimeout);
-        Assert.Equal(TimeSpan.FromSeconds(2), options.DynamicScaling.ScaleUpCooldown);
+        Assert.Equal(0.8, options.DynamicScaling.TargetUtilization);
+        Assert.Equal(TimeSpan.FromMilliseconds(200), options.DynamicScaling.ScaleUpInterval);
+        Assert.Equal(0, options.DynamicScaling.ResourceParallelismLimit);
         Assert.Equal(TimeSpan.FromSeconds(5), options.DynamicScaling.ScaleDownIdleDuration);
         options.Validate();
     }
@@ -35,6 +34,28 @@ public sealed class DispatcherOptionsTests
     public void RemovedFlatDynamicScalingMembersAreNotExposed(string memberName)
     {
         Assert.Null(typeof(DispatcherOptions).GetProperty(memberName));
+    }
+
+    [Theory]
+    [InlineData("ProbeWarmupSamples")]
+    [InlineData("ThroughputMeasurementSamples")]
+    [InlineData("ProbeTimeout")]
+    [InlineData("ScaleUpCooldown")]
+    [InlineData("MinimumUsefulThroughputGain")]
+    public void LegacyProbeOptionsAreRemoved(string memberName)
+    {
+        Assert.Null(typeof(DynamicScalingOptions).GetProperty(memberName));
+    }
+
+    [Theory]
+    [InlineData("ProbeAcceptCount")]
+    [InlineData("ProbeRejectCount")]
+    [InlineData("LastProbeGain")]
+    public void LegacyProbeStatsAreRemoved(string memberName)
+    {
+        Assert.Null(typeof(KeyedDispatcherStats).GetProperty(memberName));
+        Assert.Null(typeof(DispatcherStats).GetProperty(memberName));
+        Assert.Null(typeof(DispatcherScalingStats).GetProperty(memberName));
     }
 
     [Fact]
@@ -118,24 +139,24 @@ public sealed class DispatcherOptionsTests
     [InlineData(double.NegativeInfinity)]
     [InlineData(double.PositiveInfinity)]
     [InlineData(-0.1)]
-    public void MinimumUsefulThroughputGainMustBeFiniteAndNonNegative(double value)
+    public void CapacityGainToleranceMustBeFiniteAndNonNegative(double value)
     {
         var options = OptionsWithScaling(
             new DynamicScalingOptions
             {
-                MinimumUsefulThroughputGain = value
+                CapacityGainTolerance = value
             });
 
-        AssertParameter(nameof(DynamicScalingOptions.MinimumUsefulThroughputGain), options);
+        AssertParameter(nameof(DynamicScalingOptions.CapacityGainTolerance), options);
     }
 
     [Fact]
-    public void ZeroMinimumUsefulThroughputGainIsValid()
+    public void ZeroCapacityGainToleranceIsValid()
     {
         OptionsWithScaling(
             new DynamicScalingOptions
             {
-                MinimumUsefulThroughputGain = 0
+                CapacityGainTolerance = 0
             }).Validate();
     }
 
@@ -168,58 +189,6 @@ public sealed class DispatcherOptionsTests
     }
 
     [Fact]
-    public void ProbeWarmupSamplesMustNotBeNegative()
-    {
-        var options = OptionsWithScaling(
-            new DynamicScalingOptions
-            {
-                ProbeWarmupSamples = -1
-            });
-
-        AssertParameter(nameof(DynamicScalingOptions.ProbeWarmupSamples), options);
-    }
-
-    [Theory]
-    [InlineData(0)]
-    [InlineData(-1)]
-    public void ThroughputMeasurementSamplesMustBePositive(int value)
-    {
-        var options = OptionsWithScaling(
-            new DynamicScalingOptions
-            {
-                ThroughputMeasurementSamples = value
-            });
-
-        AssertParameter(nameof(DynamicScalingOptions.ThroughputMeasurementSamples), options);
-    }
-
-    [Theory]
-    [InlineData(0)]
-    [InlineData(-1)]
-    public void ProbeTimeoutMustBePositive(long ticks)
-    {
-        var options = OptionsWithScaling(
-            new DynamicScalingOptions
-            {
-                ProbeTimeout = TimeSpan.FromTicks(ticks)
-            });
-
-        AssertParameter(nameof(DynamicScalingOptions.ProbeTimeout), options);
-    }
-
-    [Fact]
-    public void ScaleUpCooldownMustNotBeNegative()
-    {
-        var options = OptionsWithScaling(
-            new DynamicScalingOptions
-            {
-                ScaleUpCooldown = TimeSpan.FromTicks(-1)
-            });
-
-        AssertParameter(nameof(DynamicScalingOptions.ScaleUpCooldown), options);
-    }
-
-    [Fact]
     public void ScaleDownIdleDurationMustNotBeNegative()
     {
         var options = OptionsWithScaling(
@@ -232,12 +201,12 @@ public sealed class DispatcherOptionsTests
     }
 
     [Fact]
-    public void ZeroCooldownAndIdleDurationAreValid()
+    public void ZeroScaleUpIntervalAndIdleDurationAreValid()
     {
         OptionsWithScaling(
             new DynamicScalingOptions
             {
-                ScaleUpCooldown = TimeSpan.Zero,
+                ScaleUpInterval = TimeSpan.Zero,
                 ScaleDownIdleDuration = TimeSpan.Zero
             }).Validate();
     }

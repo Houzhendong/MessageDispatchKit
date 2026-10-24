@@ -5,15 +5,7 @@ namespace MessageDispatching;
 
 public sealed class MessageDispatcher<TInput, TOutput> : IAsyncDisposable
 {
-    private sealed class WorkerRegistration : IDisposable
-    {
-        public readonly CancellationTokenSource RetirementCts = new();
-        public Task WorkerTask { get; set; } = Task.CompletedTask;
-        public bool IsWaiting;
-        public bool RetirementRequested;
-
-        public void Dispose() => RetirementCts.Dispose();
-    }
+    private readonly record struct QueuedInput(TInput Input, long ReadyTimestamp);
 
     private sealed class Subscription : IDisposable
     {
@@ -38,7 +30,7 @@ public sealed class MessageDispatcher<TInput, TOutput> : IAsyncDisposable
         }
     }
 
-    private readonly Channel<TInput> _queue;
+    private readonly Channel<QueuedInput> _queue;
     private readonly DispatcherOptions _options;
     private readonly Action<DispatcherScaleChange>? _scaleObserver;
     private readonly CancellationTokenSource _stopCts = new();
@@ -47,7 +39,8 @@ public sealed class MessageDispatcher<TInput, TOutput> : IAsyncDisposable
     private readonly object _workersLock = new();
     private readonly object _subscribersLock = new();
     private readonly List<WorkerRegistration> _workers = new();
-    private readonly DynamicScalingPolicy? _scalingPolicy;
+    private readonly LoadMatchingScalingPolicy? _scalingPolicy;
+    private readonly DispatcherLoadMonitor? _loadMonitor;
     private readonly bool _singleWorkerMode;
     private readonly bool _dynamicScalingEnabled;
     private Task? _scaleController;
@@ -57,14 +50,15 @@ public sealed class MessageDispatcher<TInput, TOutput> : IAsyncDisposable
     private long _queuedMessageCount;
     private long _scaleUpCount;
     private long _scaleDownCount;
-    private long _probeAcceptCount;
-    private long _probeRejectCount;
     private int _workerCount;
     private int _desiredWorkerCount;
     private int _busyWorkers;
     private double _throughput;
     private double _smoothedThroughput;
-    private double _lastProbeGain = double.NaN;
+    private double _averageBusyWorkers;
+    private double _queueWaitMilliseconds;
+    private double _processCpuUtilization;
+    private int _capacityLimit;
     private IMessageTransformer<TInput, TOutput>? _transformer;
     private IMessageSubscriber<TOutput>[] _subscribers = [];
     private bool _started;
@@ -81,10 +75,12 @@ public sealed class MessageDispatcher<TInput, TOutput> : IAsyncDisposable
         _singleWorkerMode = _options.EffectiveMaxParallelism == 1;
         _dynamicScalingEnabled = _options.IsDynamicScalingEnabled && !_singleWorkerMode;
         _scalingPolicy = _dynamicScalingEnabled
-            ? new DynamicScalingPolicy(_options)
+            ? new LoadMatchingScalingPolicy(_options)
             : null;
+        _loadMonitor = _dynamicScalingEnabled ? new DispatcherLoadMonitor() : null;
+        _capacityLimit = _scalingPolicy?.CapacityLimit ?? _options.Parallelism;
 
-        _queue = Channel.CreateUnbounded<TInput>(
+        _queue = Channel.CreateUnbounded<QueuedInput>(
             new UnboundedChannelOptions
             {
                 SingleReader = _singleWorkerMode,
@@ -134,6 +130,7 @@ public sealed class MessageDispatcher<TInput, TOutput> : IAsyncDisposable
             _started = true;
             Volatile.Write(ref _accepting, true);
             Volatile.Write(ref _desiredWorkerCount, _options.Parallelism);
+            _loadMonitor?.Start();
 
             lock (_workersLock)
             {
@@ -155,7 +152,6 @@ public sealed class MessageDispatcher<TInput, TOutput> : IAsyncDisposable
         var workerCount = Volatile.Read(ref _workerCount);
         var busyWorkers = Volatile.Read(ref _busyWorkers);
         var queuedMessageCount = Interlocked.Read(ref _queuedMessageCount);
-        var lastProbeGain = Volatile.Read(ref _lastProbeGain);
 
         return new DispatcherStats(
             Interlocked.Read(ref _pendingMessages),
@@ -169,10 +165,13 @@ public sealed class MessageDispatcher<TInput, TOutput> : IAsyncDisposable
             IsSaturated(workerCount, busyWorkers, queuedMessageCount),
             Interlocked.Read(ref _scaleUpCount),
             Interlocked.Read(ref _scaleDownCount),
-            Interlocked.Read(ref _probeAcceptCount),
-            Interlocked.Read(ref _probeRejectCount),
-            double.IsNaN(lastProbeGain) ? null : lastProbeGain,
-            Volatile.Read(ref _accepting) && !Volatile.Read(ref _disposed));
+            Volatile.Read(ref _accepting) && !Volatile.Read(ref _disposed))
+        {
+            AverageBusyWorkers = Volatile.Read(ref _averageBusyWorkers),
+            QueueWaitMilliseconds = Volatile.Read(ref _queueWaitMilliseconds),
+            CapacityLimit = Volatile.Read(ref _capacityLimit),
+            ProcessCpuUtilization = Volatile.Read(ref _processCpuUtilization)
+        };
     }
 
     public void Enqueue(TInput input, CancellationToken cancellationToken = default)
@@ -192,7 +191,8 @@ public sealed class MessageDispatcher<TInput, TOutput> : IAsyncDisposable
 
             Interlocked.Increment(ref _queuedMessageCount);
 
-            if (!_queue.Writer.TryWrite(input))
+            if (!_queue.Writer.TryWrite(new QueuedInput(input,
+                    _dynamicScalingEnabled ? Stopwatch.GetTimestamp() : 0)))
             {
                 Interlocked.Decrement(ref _queuedMessageCount);
                 throw new InvalidOperationException("Failed to enqueue the message.");
@@ -269,6 +269,7 @@ public sealed class MessageDispatcher<TInput, TOutput> : IAsyncDisposable
         {
             _stopCts.Dispose();
             _scaleCts.Dispose();
+            _loadMonitor?.Dispose();
         }
     }
 
@@ -312,14 +313,18 @@ public sealed class MessageDispatcher<TInput, TOutput> : IAsyncDisposable
                 return;
             }
 
-            var result = scalingPolicy.Observe(
-                new ScalingSnapshot(
-                    Volatile.Read(ref _workerCount),
-                    Volatile.Read(ref _desiredWorkerCount),
-                    Volatile.Read(ref _busyWorkers),
-                    Interlocked.Read(ref _queuedMessageCount),
-                    Interlocked.Read(ref _completedMessages),
-                    Stopwatch.GetTimestamp()));
+            var snapshot = _loadMonitor!.Sample(_workers,
+                Volatile.Read(ref _workerCount),
+                Volatile.Read(ref _desiredWorkerCount),
+                Interlocked.Read(ref _pendingMessages),
+                Interlocked.Read(ref _queuedMessageCount),
+                Interlocked.Read(ref _completedMessages),
+                _queue.Reader.TryPeek(out var oldest) ? oldest.ReadyTimestamp : null);
+            var result = scalingPolicy.Observe(snapshot);
+            Volatile.Write(ref _averageBusyWorkers, scalingPolicy.AverageBusyWorkers);
+            Volatile.Write(ref _queueWaitMilliseconds, snapshot.QueueWait.TotalMilliseconds);
+            Volatile.Write(ref _processCpuUtilization, snapshot.CpuUtilization);
+            Volatile.Write(ref _capacityLimit, scalingPolicy.CapacityLimit);
 
             PublishScalingResult(result);
             Volatile.Write(ref _desiredWorkerCount, result.DesiredWorkerCount);
@@ -354,17 +359,6 @@ public sealed class MessageDispatcher<TInput, TOutput> : IAsyncDisposable
     {
         Volatile.Write(ref _throughput, result.Throughput);
         Volatile.Write(ref _smoothedThroughput, result.SmoothedThroughput);
-
-        if (result.Reason == ScalingReason.ProbeAccepted)
-        {
-            Interlocked.Increment(ref _probeAcceptCount);
-            Volatile.Write(ref _lastProbeGain, result.ProbeGain ?? double.NaN);
-        }
-        else if (result.Reason == ScalingReason.ProbeRejected)
-        {
-            Interlocked.Increment(ref _probeRejectCount);
-            Volatile.Write(ref _lastProbeGain, result.ProbeGain ?? double.NaN);
-        }
     }
 
     private async Task WorkerLoopAsync(
@@ -386,7 +380,15 @@ public sealed class MessageDispatcher<TInput, TOutput> : IAsyncDisposable
 
                 while (_queue.Reader.TryRead(out var input))
                 {
-                    ProcessQueuedInput(input, cancellationToken);
+                    if (_dynamicScalingEnabled) registration.BeginProcessing();
+                    try
+                    {
+                        ProcessQueuedInput(input.Input, cancellationToken);
+                    }
+                    finally
+                    {
+                        if (_dynamicScalingEnabled) registration.EndProcessing();
+                    }
 
                     if (TryClaimRetirement(registration))
                     {
@@ -446,6 +448,11 @@ public sealed class MessageDispatcher<TInput, TOutput> : IAsyncDisposable
         }
 
         if (IsTerminalDrain())
+        {
+            return false;
+        }
+
+        if (Volatile.Read(ref _workerCount) <= Volatile.Read(ref _desiredWorkerCount))
         {
             return false;
         }
@@ -555,7 +562,7 @@ public sealed class MessageDispatcher<TInput, TOutput> : IAsyncDisposable
             {
                 while (_queue.Reader.TryRead(out var input))
                 {
-                    ProcessQueuedInput(input, cancellationToken);
+                    ProcessQueuedInput(input.Input, cancellationToken);
                 }
             }
         }
@@ -632,7 +639,6 @@ public sealed class MessageDispatcher<TInput, TOutput> : IAsyncDisposable
         var workerCount = Volatile.Read(ref _workerCount);
         var busyWorkers = Volatile.Read(ref _busyWorkers);
         var queuedMessageCount = Interlocked.Read(ref _queuedMessageCount);
-        var lastProbeGain = Volatile.Read(ref _lastProbeGain);
 
         return new DispatcherScalingStats(
             Interlocked.Read(ref _pendingMessages),
@@ -646,10 +652,13 @@ public sealed class MessageDispatcher<TInput, TOutput> : IAsyncDisposable
             IsSaturated(workerCount, busyWorkers, queuedMessageCount),
             Interlocked.Read(ref _scaleUpCount),
             Interlocked.Read(ref _scaleDownCount),
-            Interlocked.Read(ref _probeAcceptCount),
-            Interlocked.Read(ref _probeRejectCount),
-            double.IsNaN(lastProbeGain) ? null : lastProbeGain,
-            Volatile.Read(ref _accepting) && !Volatile.Read(ref _disposed));
+            Volatile.Read(ref _accepting) && !Volatile.Read(ref _disposed))
+        {
+            AverageBusyWorkers = Volatile.Read(ref _averageBusyWorkers),
+            QueueWaitMilliseconds = Volatile.Read(ref _queueWaitMilliseconds),
+            CapacityLimit = Volatile.Read(ref _capacityLimit),
+            ProcessCpuUtilization = Volatile.Read(ref _processCpuUtilization)
+        };
     }
 
     private int StartWorkerCore()
@@ -685,6 +694,7 @@ public sealed class MessageDispatcher<TInput, TOutput> : IAsyncDisposable
             var worker = _workers[i];
             if (worker.WorkerTask.IsCompleted)
             {
+                _loadMonitor?.Retire(worker);
                 worker.Dispose();
                 _workers.RemoveAt(i);
             }

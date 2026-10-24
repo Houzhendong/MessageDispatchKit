@@ -12,7 +12,10 @@ public readonly record struct DispatcherStats(
     bool IsSaturated,
     long ScaleUpCount,
     long ScaleDownCount,
-    long ProbeAcceptCount,
-    long ProbeRejectCount,
-    double? LastProbeGain,
-    bool Accepting);
+    bool Accepting)
+{
+    public double AverageBusyWorkers { get; init; }
+    public double QueueWaitMilliseconds { get; init; }
+    public int CapacityLimit { get; init; }
+    public double ProcessCpuUtilization { get; init; }
+}

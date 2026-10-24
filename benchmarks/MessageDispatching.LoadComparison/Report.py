@@ -20,9 +20,11 @@ def main():
     runs = read_csv(directory / "runs.csv")
     scenarios = list(dict.fromkeys(row["Scenario"] for row in summary))
     cells = []
+    revision = metadata.get("NewSourceRevision", metadata["Branch"])
+    source_label = f"{revision} 的工作树" if metadata.get("NewWorkingTreeDirty", True) else revision
     lines = [
         "# 新旧扩容算法实测对比", "",
-        f"旧版：`{metadata['Baseline']}`；新版：`{metadata['Branch']}` 的工作树。",
+        f"旧版：`{metadata['Baseline']}`；新版实测代码：`{source_label}`。",
         f"UTC 时间：{metadata['DateUtc']}。每类场景新旧各 {metadata['Repeats']} 轮，"
         f"投递期 {metadata['DurationSeconds']} 秒。", "",
         f"环境：{metadata['LogicalProcessors']} 个可见逻辑 CPU，.NET 8 Release。"
